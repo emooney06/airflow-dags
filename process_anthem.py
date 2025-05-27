@@ -13,7 +13,7 @@ default_args = {
 # Define the DAG
 @dag(
     default_args=default_args,
-    schedule_interval='@monthly',  # Schedule the DAG to run monthly
+    schedule='@monthly',  # Schedule the DAG to run monthly
     start_date=days_ago(1),
     catchup=False,
     tags=['Anthem', 'Index'],
