@@ -1,7 +1,7 @@
 from airflow import DAG
 from airflow.decorators import dag, task
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.utils.dates import days_ago
+from datetime import datetime, timedelta
 import requests
 
 # Default arguments for the DAG
@@ -14,7 +14,7 @@ default_args = {
 @dag(
     default_args=default_args,
     schedule='@monthly',  # Schedule the DAG to run monthly
-    start_date=days_ago(1),
+    start_date=datetime.now() - timedelta(days=1),
     catchup=False,
     tags=['Anthem', 'Index'],
 )
