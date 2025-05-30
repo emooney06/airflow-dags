@@ -32,12 +32,11 @@ dag = DAG(
     'process_anthem_iceberg',
     default_args=default_args,
     description='Process Anthem price transparency data to Iceberg tables',
-    schedule_interval='@monthly',  # Monthly execution - adjust as needed
+    schedule='@monthly',  # Monthly execution - adjust as needed
     start_date=datetime(2025, 5, 1),
     catchup=False,
     tags=['price-transparency', 'anthem', 'iceberg'],
 )
-
 # Configuration - Centralize all config here for easy updates
 config = {
     # S3 paths
