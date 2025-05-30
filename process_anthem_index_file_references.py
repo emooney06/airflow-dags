@@ -60,8 +60,8 @@ config = {
 # Task 1: Check if the index file exists
 check_index_file = S3KeySensor(
     task_id='check_index_file',
-    bucket_key=f"{config['s3_bucket']}/{config['index_file_key']}",
-    bucket_name=None,  # Not needed when full path provided in bucket_key
+    bucket_key=config['index_file_key'],
+    bucket_name=config['s3_bucket'],
     aws_conn_id='aws_default',
     timeout=60 * 60 * 12,  # 12 hours timeout
     poke_interval=60 * 30,  # Check every 30 minutes
