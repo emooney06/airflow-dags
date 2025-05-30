@@ -29,7 +29,7 @@ default_args = {
 
 # Define DAG
 dag = DAG(
-    'process_anthem_iceberg',
+    'process_anthem_index_file_references',
     default_args=default_args,
     description='Process Anthem price transparency data to Iceberg tables',
     schedule='@monthly',  # Monthly execution - adjust as needed
