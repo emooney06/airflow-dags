@@ -330,4 +330,4 @@ process_files_task = PythonOperator(
 )
 
 # Define task dependencies
-check_index_file >> setup_env >> extract_file_refs >> verify_task >> process_files
+check_index_file >> setup_env >> extract_file_refs >> verify_task >> process_files_task
