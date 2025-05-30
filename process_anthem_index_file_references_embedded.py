@@ -18,6 +18,11 @@ import traceback
 from urllib.parse import urlparse
 import ast
 
+# PySpark imports for Iceberg integration
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, StringType, DateType, TimestampType
+from pyspark.sql.functions import col, lit, to_date, regexp_extract, expr
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
@@ -47,22 +52,28 @@ dag = DAG(
 
 # Configuration - Centralize all config here for easy updates
 config = {
-    # S3 paths
-    's3_bucket': 'price-transparency-raw',
-    # Use a fixed path for testing, or the templated path for production
-    'index_file_key': 'payer/anthem/index_files/main-index/2025-05-01_anthem_index.json.gz',  # Fixed path for now
-    'warehouse_location': 's3a://price-transparency-raw/warehouse',
+    # S3 Configuration - access using standard Hadoop APIs for cloud-agnostic approach
+    'bucket_name': 'transparency-in-coverage',
+    'index_file_key': 'payer/anthem/index_files/main-index/2025-05-01_anthem_index.json.gz',
+    'local_download_path': "/home/airflow/anthem-processing/anthem_index.json.gz",
     
-    # Iceberg config
+    # Output configuration
+    'output_file': "/home/airflow/anthem-processing/file_references.md",
+    'log_file': "/home/airflow/logs/anthem/extraction_log.txt",
+    
+    # Processing configuration
+    'max_chunks': None,  # Process the entire file (24GB+) - this is why it will run for hours
+    'batch_size': 5000,  # Number of references to write to Iceberg in one batch
+    'sample_size': 20,   # Number of sample URLs to include in output
+    
+    # Iceberg and Spark configuration - cloud-agnostic approach using standard components
     'catalog_name': 'anthem_catalog',
-    'file_refs_table': 'anthem_file_refs',
-    
-    # Processing parameters
-    'batch_size': 10000,
-    'max_records': None,  # Set to a number for testing/limiting
-    'max_chunks': 5,      # Number of chunks to process (each 10MB)
-    'output_file': '/home/airflow/anthem_file_references.txt',
-    'log_file': '/home/airflow/anthem_extraction.log',
+    'file_refs_table': 'anthem_file_references',
+    'warehouse_location': '/home/airflow/iceberg_warehouse',  # Local warehouse for cloud-agnostic approach
+    'spark_packages': [
+        "org.apache.iceberg:iceberg-spark3:0.14.0",  # Standard Iceberg package
+        "org.apache.hadoop:hadoop-aws:3.3.1"         # Standard Hadoop package for AWS connectivity
+    ]
 }
 
 # Task 1: Check if the index file exists
@@ -77,6 +88,60 @@ check_index_file = S3KeySensor(
 )
 
 # Task 2: Setup the environment and prepare for data processing
+def init_spark(**context):
+    """Initialize Spark session with Iceberg support using a cloud-agnostic approach."""
+    print(f"🔥 Initializing Spark with Iceberg support...")
+    print(f"   Warehouse location: {config['warehouse_location']}")
+    
+    # Create the Spark session with Iceberg configs - using standard components rather than provider-specific
+    spark = (SparkSession.builder
+             .appName("Anthem File References Extractor")
+             .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+             .config(f"spark.sql.catalog.{config['catalog_name']}", "org.apache.iceberg.spark.SparkCatalog")
+             .config(f"spark.sql.catalog.{config['catalog_name']}.type", "hadoop")
+             .config(f"spark.sql.catalog.{config['catalog_name']}.warehouse", config['warehouse_location'])
+             .config("spark.jars.packages", ",".join(config['spark_packages']))
+             .config("spark.sql.catalog.spark_catalog", "org.apache.iceberg.spark.SparkSessionCatalog")
+             .config("spark.sql.catalog.spark_catalog.type", "hive")
+             .config("spark.sql.parquet.compression.codec", "zstd")
+             # Using the S3A filesystem from Hadoop, which is cloud-agnostic
+             .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+             .config("spark.hadoop.fs.s3a.aws.credentials.provider", "com.amazonaws.auth.DefaultAWSCredentialsProviderChain")
+             .getOrCreate())
+    
+    # Set log level
+    spark.sparkContext.setLogLevel("WARN")
+    
+    # Print Spark version
+    print(f"Spark version: {spark.version}")
+    
+    return spark
+
+
+def create_file_refs_table(spark):
+    """Create the Iceberg table for file references if it doesn't exist."""
+    print(f"📝 Creating Iceberg table {config['catalog_name']}.{config['file_refs_table']} if it doesn't exist...")
+    
+    # Create table using standard Iceberg approach - cloud provider independent
+    spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS {config['catalog_name']}.{config['file_refs_table']} (
+        reporting_entity_name STRING,
+        reporting_entity_type STRING,
+        plan_name STRING,
+        plan_id STRING,
+        plan_market_type STRING,
+        file_url STRING,
+        file_network STRING,
+        file_type STRING,
+        file_date DATE,
+        extracted_ts TIMESTAMP
+    ) USING iceberg
+    PARTITIONED BY (file_date)
+    """)
+    
+    print(f"✅ Table {config['catalog_name']}.{config['file_refs_table']} is ready")
+
+
 def setup_environment(**context):
     """Create working directory and prepare the environment."""
     import subprocess
@@ -116,16 +181,28 @@ def setup_environment(**context):
 # Task 3: Extract file references and save to output file
 def extract_file_references(**context):
     """
-    Extract file references from the Anthem index file.
+    Extract file references from the Anthem index file and store in Iceberg tables.
     This function reads the index file directly from S3, extracts URLs,
-    and writes the results to a text file.
+    and writes them to both a text file and Iceberg tables using a cloud-agnostic approach.
     """
     # Initialize log file
     with open(config['log_file'], "w") as f:
         f.write(f"=== Anthem Index Extraction - Started {datetime.now()} ===\n")
     
     start_time = time.time()
-    log_message(f"Starting Anthem index file extraction")
+    log_message(f"Starting Anthem index file extraction with Iceberg integration")
+    
+    # Initialize Spark with Iceberg - cloud-agnostic approach
+    try:
+        spark = init_spark()
+        create_file_refs_table(spark)
+        log_message(f"Successfully initialized Spark and created Iceberg table schema")
+    except Exception as e:
+        log_message(f"❌ Failed to initialize Spark: {e}")
+        with open(config['output_file'], "w") as f:
+            f.write(f"ERROR: Spark initialization failed: {e}\n")
+        traceback.print_exc(file=open(config['log_file'], "a"))
+        return 1
     
     # File reference patterns
     URL_PATTERNS = [
@@ -172,8 +249,32 @@ def extract_file_references(**context):
         references = []
         offset = 0
         chunk_size = 10 * 1024 * 1024  # 10MB chunks
-        max_chunks = config['max_chunks']  # Process up to X chunks to ensure we get actual data
+        max_chunks = config['max_chunks']  # If None, process the entire file
         chunks_processed = 0
+        total_processed = 0
+        batch_count = 0
+        
+        # Initialize counters for different file types
+        in_network_count = 0
+        allowed_amount_count = 0
+        other_count = 0
+        
+        log_message(f"Processing the entire 24GB+ Anthem index file. This will take hours...")
+        log_message(f"Using cloud-agnostic Iceberg tables for storage")
+        
+        # Create schema for Iceberg table - independent of cloud provider
+        schema = StructType([
+            StructField("reporting_entity_name", StringType(), True),
+            StructField("reporting_entity_type", StringType(), True),
+            StructField("plan_name", StringType(), True),
+            StructField("plan_id", StringType(), True),
+            StructField("plan_market_type", StringType(), True),
+            StructField("file_url", StringType(), True),
+            StructField("file_network", StringType(), True),
+            StructField("file_type", StringType(), True),
+            StructField("file_date", DateType(), True),
+            StructField("extracted_ts", TimestampType(), True)
+        ])
         
         for chunk_num in range(max_chunks):
             chunk_start = time.time()
@@ -225,10 +326,78 @@ def extract_file_references(**context):
                 
                 log_message(f"Extracted {len(chunk_refs)} references in {time.time()-pattern_start:.2f}s")
                 references.extend(chunk_refs)
+                total_processed += len(chunk_refs)
                 
                 # Move to next chunk
                 offset += len(chunk_data)
                 chunks_processed += 1
+                
+                # Check if we have enough references to process in a batch
+                if len(references) >= config['batch_size']:
+                    # Process batch and write to Iceberg table using cloud-agnostic approach
+                    batch_count += 1
+                    log_message(f"💾 Processing batch {batch_count}: Writing {len(references)} references to Iceberg table...")
+                    
+                    # Create data for DataFrame
+                    file_refs = []
+                    for ref in references:
+                        # Categorize reference
+                        file_type = "unknown"
+                        file_network = "other"
+                        
+                        if "in-network" in ref.lower():
+                            file_network = "in-network"
+                            in_network_count += 1
+                        elif "allowed-amount" in ref.lower():
+                            file_network = "allowed-amount"
+                            allowed_amount_count += 1
+                        else:
+                            other_count += 1
+                            
+                        # Determine file type
+                        if ref.endswith(".json"):
+                            file_type = "json"
+                        elif ref.endswith(".csv"):
+                            file_type = "csv"
+                        elif ref.endswith(".gz"):
+                            if ".json.gz" in ref.lower():
+                                file_type = "json.gz"
+                            elif ".csv.gz" in ref.lower():
+                                file_type = "csv.gz"
+                            else:
+                                file_type = "gz"
+                        
+                        # Create record
+                        file_refs.append({
+                            "reporting_entity_name": "Anthem",
+                            "reporting_entity_type": "payer",
+                            "plan_name": None,
+                            "plan_id": None,
+                            "plan_market_type": None,
+                            "file_url": ref,
+                            "file_network": file_network,
+                            "file_type": file_type,
+                            "file_date": datetime.now().date(),
+                            "extracted_ts": datetime.now()
+                        })
+                    
+                    # Convert to DataFrame and write to Iceberg
+                    batch_start = time.time()
+                    try:
+                        # Create DataFrame
+                        df = spark.createDataFrame(file_refs, schema)
+                        
+                        # Write to Iceberg table in append mode - cloud agnostic approach
+                        df.writeTo(f"{config['catalog_name']}.{config['file_refs_table']}").append()
+                        
+                        batch_time = time.time() - batch_start
+                        log_message(f"✅ Successfully wrote batch {batch_count} to Iceberg table in {batch_time:.2f}s")
+                    except Exception as e:
+                        log_message(f"❌ Error writing batch {batch_count} to Iceberg: {e}")
+                        traceback.print_exc(file=open(config['log_file'], "a"))
+                    
+                    # Clear the batch
+                    references = []
                 
                 # Log chunk processing stats
                 chunk_time = time.time() - chunk_start
@@ -256,59 +425,168 @@ def extract_file_references(**context):
                 f.write("ERROR: Failed to process any data chunks\n")
             return 1
         
-        # Remove duplicates
-        unique_refs = list(set(references))
-        log_message(f"🔍 Found {len(references)} total references, {len(unique_refs)} unique")
+        # Process any remaining references before finishing
+        if len(references) > 0:
+            batch_count += 1
+            log_message(f"💾 Processing final batch {batch_count}: Writing {len(references)} remaining references to Iceberg table...")
+            
+            # Create data for DataFrame
+            file_refs = []
+            for ref in references:
+                # Categorize reference
+                file_type = "unknown"
+                file_network = "other"
+                
+                if "in-network" in ref.lower():
+                    file_network = "in-network"
+                    in_network_count += 1
+                elif "allowed-amount" in ref.lower():
+                    file_network = "allowed-amount"
+                    allowed_amount_count += 1
+                else:
+                    other_count += 1
+                    
+                # Determine file type
+                if ref.endswith(".json"):
+                    file_type = "json"
+                elif ref.endswith(".csv"):
+                    file_type = "csv"
+                elif ref.endswith(".gz"):
+                    if ".json.gz" in ref.lower():
+                        file_type = "json.gz"
+                    elif ".csv.gz" in ref.lower():
+                        file_type = "csv.gz"
+                    else:
+                        file_type = "gz"
+                
+                # Create record
+                file_refs.append({
+                    "reporting_entity_name": "Anthem",
+                    "reporting_entity_type": "payer",
+                    "plan_name": None,
+                    "plan_id": None,
+                    "plan_market_type": None,
+                    "file_url": ref,
+                    "file_network": file_network,
+                    "file_type": file_type,
+                    "file_date": datetime.now().date(),
+                    "extracted_ts": datetime.now()
+                })
+            
+            # Convert to DataFrame and write to Iceberg
+            try:
+                # Create DataFrame
+                df = spark.createDataFrame(file_refs, schema)
+                
+                # Write to Iceberg table in append mode
+                df.writeTo(f"{config['catalog_name']}.{config['file_refs_table']}").append()
+                
+                log_message(f"✅ Successfully wrote final batch to Iceberg table")
+            except Exception as e:
+                log_message(f"❌ Error writing final batch to Iceberg: {e}")
+                traceback.print_exc(file=open(config['log_file'], "a"))
         
-        # Categorize references
-        in_network = [ref for ref in unique_refs if "in-network" in ref.lower()]
-        allowed_amount = [ref for ref in unique_refs if "allowed-amount" in ref.lower()]
-        other = [ref for ref in unique_refs if "in-network" not in ref.lower() and "allowed-amount" not in ref.lower()]
+        # Query Iceberg table for final statistics
+        log_message(f"Querying Iceberg table for final statistics...")
+        try:
+            # Use Spark SQL to query the Iceberg table
+            stats_df = spark.sql(f"""
+                SELECT 
+                    file_network,
+                    COUNT(*) as count 
+                FROM {config['catalog_name']}.{config['file_refs_table']} 
+                GROUP BY file_network
+            """)
+            
+            # Get counts by type
+            in_network_count = 0
+            allowed_amount_count = 0
+            other_count = 0
+            total_count = 0
+            
+            # Process results
+            for row in stats_df.collect():
+                network = row['file_network'] 
+                count = row['count']
+                total_count += count
+                
+                if network == "in-network":
+                    in_network_count = count
+                elif network == "allowed-amount":
+                    allowed_amount_count = count
+                else:
+                    other_count += count
+                    
+            log_message(f"📊 Iceberg table stats: {total_count} total references")
+            log_message(f"📊 Categories: {in_network_count} in-network, {allowed_amount_count} allowed-amount, {other_count} other")
+            
+            # Sample some URLs
+            sample_df = spark.sql(f"""
+                SELECT file_network, file_url 
+                FROM {config['catalog_name']}.{config['file_refs_table']} 
+                LIMIT 20
+            """)
+            
+            sample_urls = [row['file_url'] for row in sample_df.collect()]
+            
+        except Exception as e:
+            log_message(f"Error querying Iceberg table: {e}")
+            log_message("Falling back to local statistics (may be inaccurate if batches were processed)")
+            
+            # Use the running counters instead
+            total_count = in_network_count + allowed_amount_count + other_count
+            sample_urls = []
         
-        log_message(f"📊 Categories: {len(in_network)} in-network, {len(allowed_amount)} allowed-amount, {len(other)} other")
-        
-        # Save results
+        # Save results using data from Iceberg table
         with open(config['output_file'], "w") as f:
-            f.write(f"TOTAL_REFS: {len(unique_refs)}\n")
-            f.write(f"IN_NETWORK: {len(in_network)}\n")
-            f.write(f"ALLOWED_AMOUNT: {len(allowed_amount)}\n")
-            f.write(f"OTHER: {len(other)}\n")
-            f.write(f"CHUNKS_PROCESSED: {chunks_processed}\n\n")
+            f.write(f"# Anthem File References\n\n")
+            f.write(f"Extracted on {datetime.now()}\n\n")
+            f.write(f"## Summary\n")
+            f.write(f"- Processed {total_processed:,} total references\n")
+            f.write(f"- In-Network files: {in_network_count:,}\n")
+            f.write(f"- Allowed Amount files: {allowed_amount_count:,}\n")
+            f.write(f"- Other files: {other_count:,}\n\n")
             
-            # Write sample of each type
-            f.write("SAMPLES:\n")
+            f.write(f"## Iceberg Table Information\n")
+            f.write(f"- Catalog: {config['catalog_name']}\n")
+            f.write(f"- Table: {config['file_refs_table']}\n")
+            f.write(f"- Warehouse Location: {config['warehouse_location']}\n\n")
             
-            if in_network:
-                f.write("\nIN-NETWORK SAMPLES:\n")
-                for i, ref in enumerate(in_network[:10]):
-                    f.write(f"{i+1}. {ref}\n")
-                    
-            if allowed_amount:
-                f.write("\nALLOWED-AMOUNT SAMPLES:\n")
-                for i, ref in enumerate(allowed_amount[:10]):
-                    f.write(f"{i+1}. {ref}\n")
-                    
-            if other:
-                f.write("\nOTHER SAMPLES:\n")
-                for i, ref in enumerate(other[:10]):
-                    f.write(f"{i+1}. {ref}\n")
-        
-        total_time = time.time() - start_time
-        log_message(f"✅ Extraction complete! Processed in {total_time:.2f}s")
-        log_message(f"📄 Results written to {config['output_file']}")
-        log_message(f"📊 Found {len(unique_refs)} unique file references")
+            f.write(f"## Sample URLs\n")
+            for url in sample_urls[:20]:  # Show up to 20 examples
+                f.write(f"- {url}\n")
         
         # Push results to XCom for downstream tasks
-        context['ti'].xcom_push(key='total_file_refs', value=len(unique_refs))
-        context['ti'].xcom_push(key='in_network_count', value=len(in_network))
-        context['ti'].xcom_push(key='allowed_amount_count', value=len(allowed_amount))
-        context['ti'].xcom_push(key='other_count', value=len(other))
+        context['ti'].xcom_push(key='total_file_refs', value=total_count)
+        context['ti'].xcom_push(key='in_network_count', value=in_network_count)
+        context['ti'].xcom_push(key='allowed_amount_count', value=allowed_amount_count)
+        context['ti'].xcom_push(key='other_count', value=other_count)
         
         # For the sample URLs, just push a smaller list to avoid XCom size limits
-        all_samples = in_network[:5] + allowed_amount[:5] + other[:5]
-        context['ti'].xcom_push(key='sample_urls', value=str(all_samples[:10]))
+        context['ti'].xcom_push(key='sample_urls', value=sample_urls[:15])
         
-        return len(unique_refs)
+        # Close Spark session
+        try:
+            if 'spark' in locals() and spark is not None:
+                log_message("Stopping Spark session...")
+                spark.stop()
+                log_message("Spark session stopped successfully")
+        except Exception as e:
+            log_message(f"Error stopping Spark session: {e}")
+        
+        # Record elapsed time
+        end_time = time.time()
+        elapsed = end_time - start_time
+        hours = int(elapsed // 3600)
+        minutes = int((elapsed % 3600) // 60)
+        seconds = int(elapsed % 60)
+        
+        log_message(f"✅ Extraction complete! Took {elapsed:.2f} seconds ({hours}h {minutes}m {seconds}s)")
+        log_message(f"✅ Successfully processed {total_processed:,} total references")
+        log_message(f"📊 Data written to Iceberg table: {config['catalog_name']}.{config['file_refs_table']}")
+        log_message(f"📝 Check the output file for summary: {config['output_file']}")
+        
+        return 0
         
     except Exception as e:
         log_message(f"❌ Error in main process: {e}")
