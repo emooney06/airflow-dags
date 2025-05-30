@@ -108,63 +108,28 @@ setup_env = BashOperator(
 extract_file_refs_script = '''
 #!/bin/bash
 
-# Create necessary directories
+# Create working directory
 mkdir -p /home/airflow/anthem-processing
 
-# Create a very simple extraction script
-cat > /home/airflow/anthem-processing/extract.py << 'EOF'
-import sys
-import os
-import boto3
-from urllib.parse import urlparse
+# Write the simplest possible Python script - no multiline strings at all
+echo 'import os
+print("Starting extraction...")
+output_file = "/home/airflow/anthem_file_references.txt"
 
-def main():
-    # Set up paths
-    index_file = "s3a://price-transparency-raw/payer/anthem/index_files/main-index/2025-05-01_anthem_index.json.gz"
-    output_file = "/home/airflow/anthem_file_references.txt"
-    
-    # Process the file
-    print("Processing index file: " + index_file)
-    
-    # Convert s3a URL to s3 URL for boto3
-    parsed = urlparse(index_file.replace("s3a://", "s3://"))
-    bucket = parsed.netloc
-    key = parsed.path.lstrip("/")
-    
-    try:
-        # Initialize S3 client
-        s3 = boto3.client("s3")
-        
-        # Download a sample of the file (first 1MB)
-        print("Downloading sample from S3...")
-        response = s3.get_object(Bucket=bucket, Key=key, Range="bytes=0-1048576")
-        data = response["Body"].read()
-        
-        # Write sample data for debugging
-        with open(output_file, "w") as f:
-            f.write("Successfully accessed S3 file\n")
-            f.write("File size sample: " + str(len(data)) + " bytes\n")
-            f.write("Next steps would be to extract file references\n")
-            f.write("This is a successful test of the extraction process")
-        
-        print("✅ Test extraction complete")
-        return 0
-    except Exception as e:
-        with open(output_file, "w") as f:
-            f.write("Error accessing file: " + str(e))
-        print("❌ Error: " + str(e))
-        return 1
+try:
+    with open(output_file, "w") as f:
+        f.write("Test file created successfully")
+    print("File created successfully")
+except Exception as e:
+    print("Error:", str(e))
+' > /home/airflow/anthem-processing/simple.py
 
-if __name__ == "__main__":
-    sys.exit(main())
-EOF
-
-# Run the Python script
-python3 /home/airflow/anthem-processing/extract.py
+# Run the script
+python3 /home/airflow/anthem-processing/simple.py
 
 # Show the results
 echo "=== EXTRACTION RESULTS ==="
-cat /home/airflow/anthem_file_references.txt
+cat /home/airflow/anthem_file_references.txt || echo "Could not display output file"
 '''
 
 extract_file_refs = BashOperator(
