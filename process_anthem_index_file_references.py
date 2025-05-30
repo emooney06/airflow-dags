@@ -105,7 +105,7 @@ setup_env = BashOperator(
 )
 
 # Task 3: Extract file references and save to Iceberg table
-extract_file_refs_script = """
+extract_file_refs_script = '''
 #!/bin/bash
 
 # Create necessary directories
@@ -147,7 +147,7 @@ def main():
     args = parser.parse_args()
     
     # Download a small sample of the file for testing
-    print(f"Processing index file: {args.index_file}")
+    print("Processing index file: " + args.index_file)
     s3 = boto3.client('s3')
     parsed = urlparse(args.index_file.replace('s3a://', 's3://'))
     bucket = parsed.netloc
@@ -156,9 +156,9 @@ def main():
     # Test credentials and bucket access
     try:
         s3.head_object(Bucket=bucket, Key=key)
-        print(f"✅ Successfully accessed {args.index_file}")
+        print("✅ Successfully accessed " + args.index_file)
     except Exception as e:
-        print(f"❌ Error accessing index file: {str(e)}")
+        print("❌ Error accessing index file: " + str(e))
         sys.exit(1)
     
     # For test purposes, only download first part of the file
@@ -186,14 +186,14 @@ def main():
         
         # Save results
         with open(args.output_file, 'w') as f:
-            f.write(f"Found {len(references)} file references\n")
+            f.write("Found " + str(len(references)) + " file references\n")
             for i, ref in enumerate(references[:100]):  # Show first 100 only
-                f.write(f"{i+1}. {ref}\n")
+                f.write(str(i+1) + ". " + str(ref) + "\n")
         
-        print(f"✅ Extracted {len(references)} file references to {args.output_file}")
+        print("✅ Extracted " + str(len(references)) + " file references to " + args.output_file)
         return 0
     except Exception as e:
-        print(f"❌ Error processing file: {str(e)}")
+        print("❌ Error processing file: " + str(e))
         return 1
 
 if __name__ == "__main__":
@@ -213,7 +213,7 @@ python3 /home/airflow/anthem-processing/extract_files.py \
 # Show the results
 echo "=== EXTRACTION RESULTS ==="
 cat "$OUTPUT_FILE"
-"""
+'''
 
 extract_file_refs = BashOperator(
     task_id='extract_file_references',
