@@ -111,25 +111,148 @@ extract_file_refs_script = '''
 # Create working directory
 mkdir -p /home/airflow/anthem-processing
 
-# Write the simplest possible Python script - no multiline strings at all
-echo 'import os
-print("Starting extraction...")
-output_file = "/home/airflow/anthem_file_references.txt"
+# Create a Python script for extracting file references
+cat > /home/airflow/anthem-processing/extract_refs.py << 'EOF'
+import os
+import sys
+import boto3
+import gzip
+import re
+import json
+from urllib.parse import urlparse
 
-try:
-    with open(output_file, "w") as f:
-        f.write("Test file created successfully")
-    print("File created successfully")
-except Exception as e:
-    print("Error:", str(e))
-' > /home/airflow/anthem-processing/simple.py
+# Set paths
+INDEX_FILE = "s3a://price-transparency-raw/payer/anthem/index_files/main-index/2025-05-01_anthem_index.json.gz"
+OUTPUT_FILE = "/home/airflow/anthem_file_references.txt"
 
-# Run the script
-python3 /home/airflow/anthem-processing/simple.py
+# File reference patterns
+URL_PATTERNS = [
+    r'"in_network_files"\s*:\s*\[\s*"([^"]+)"',
+    r'"allowed_amount_files"\s*:\s*\[\s*"([^"]+)"',
+    r'"url"\s*:\s*"([^"]+\.(?:json|csv|parquet|gz))"',
+    r'https?://[^"\s]+\.(?:json|csv|parquet|gz)'
+]
 
-# Show the results
+def main():
+    try:
+        print("Starting extraction from", INDEX_FILE)
+        
+        # Parse S3 URL
+        parsed = urlparse(INDEX_FILE.replace("s3a://", "s3://"))
+        bucket = parsed.netloc
+        key = parsed.path.lstrip("/")
+        
+        # Initialize S3 client
+        s3 = boto3.client("s3")
+        
+        # Check if file exists
+        try:
+            s3.head_object(Bucket=bucket, Key=key)
+            print("Successfully accessed S3 file")
+        except Exception as e:
+            print("Error accessing index file:", str(e))
+            return 1
+        
+        # Read file in chunks (10MB at a time)
+        references = []
+        offset = 0
+        chunk_size = 10 * 1024 * 1024  # 10MB chunks
+        max_chunks = 10  # Process up to 100MB for safety
+        
+        for chunk in range(max_chunks):
+            try:
+                # Get range of bytes
+                range_header = f"bytes={offset}-{offset+chunk_size-1}"
+                response = s3.get_object(Bucket=bucket, Key=key, Range=range_header)
+                chunk_data = response["Body"].read()
+                
+                if not chunk_data:
+                    break  # End of file
+                    
+                # Decompress if gzipped
+                if key.endswith(".gz"):
+                    try:
+                        chunk_data = gzip.decompress(chunk_data)
+                    except Exception as e:
+                        print(f"Warning: Could not decompress chunk {chunk}: {str(e)}")
+                
+                # Convert to string and find patterns
+                chunk_str = chunk_data.decode("utf-8", errors="replace")
+                
+                # Extract URLs using regex patterns
+                for pattern in URL_PATTERNS:
+                    matches = re.findall(pattern, chunk_str)
+                    references.extend(matches)
+                    
+                print(f"Processed chunk {chunk+1}, found {len(references)} references so far")
+                
+                # Move to next chunk
+                offset += len(chunk_data)
+                
+                # If this chunk was smaller than requested, we've reached EOF
+                if len(chunk_data) < chunk_size:
+                    break
+                    
+            except Exception as e:
+                print(f"Error processing chunk {chunk}: {str(e)}")
+                if chunk > 0:  # Only break if we've processed at least one chunk
+                    break
+                else:
+                    return 1
+        
+        # Remove duplicates
+        unique_refs = list(set(references))
+        
+        # Categorize references
+        in_network = [ref for ref in unique_refs if "in-network" in ref.lower()]
+        allowed_amount = [ref for ref in unique_refs if "allowed-amount" in ref.lower()]
+        other = [ref for ref in unique_refs if "in-network" not in ref.lower() and "allowed-amount" not in ref.lower()]
+        
+        # Save results
+        with open(OUTPUT_FILE, "w") as f:
+            f.write(f"TOTAL_REFS: {len(unique_refs)}\n")
+            f.write(f"IN_NETWORK: {len(in_network)}\n")
+            f.write(f"ALLOWED_AMOUNT: {len(allowed_amount)}\n")
+            f.write(f"OTHER: {len(other)}\n\n")
+            
+            # Write sample of each type
+            f.write("SAMPLES:\n")
+            
+            if in_network:
+                f.write("\nIN-NETWORK SAMPLES:\n")
+                for i, ref in enumerate(in_network[:10]):
+                    f.write(f"{i+1}. {ref}\n")
+                    
+            if allowed_amount:
+                f.write("\nALLOWED-AMOUNT SAMPLES:\n")
+                for i, ref in enumerate(allowed_amount[:10]):
+                    f.write(f"{i+1}. {ref}\n")
+                    
+            if other:
+                f.write("\nOTHER SAMPLES:\n")
+                for i, ref in enumerate(other[:10]):
+                    f.write(f"{i+1}. {ref}\n")
+        
+        print(f"Extraction complete! Found {len(unique_refs)} unique file references")
+        return 0
+        
+    except Exception as e:
+        print(f"Error in main process: {str(e)}")
+        # Write error to output file for Airflow to read
+        with open(OUTPUT_FILE, "w") as f:
+            f.write(f"ERROR: {str(e)}\n")
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
+EOF
+
+# Run the extraction script
+python3 /home/airflow/anthem-processing/extract_refs.py
+
+# Show the results summary
 echo "=== EXTRACTION RESULTS ==="
-cat /home/airflow/anthem_file_references.txt || echo "Could not display output file"
+head -n 20 /home/airflow/anthem_file_references.txt || echo "Could not display output file"
 '''
 
 extract_file_refs = BashOperator(
@@ -150,6 +273,7 @@ extract_file_refs = BashOperator(
 def verify_extraction(**context):
     """Verify the extracted file references from the output file."""
     import os
+    import re
     
     output_file = "/home/airflow/anthem_file_references.txt"
     
@@ -161,31 +285,67 @@ def verify_extraction(**context):
     with open(output_file, 'r') as f:
         content = f.read()
     
-    # For development/testing - don't fail on no references
-    total_refs = 1  # Simulate finding at least one reference for testing
+    # Check for errors in the output
+    if content.startswith("ERROR:"):
+        error_msg = content.split("\n")[0].strip()
+        raise ValueError(f"Extraction failed: {error_msg}")
     
-    # Count by type - in test mode, just show zeros
+    # Parse the summary statistics
+    total_refs = 0
     in_network_count = 0
     allowed_amount_count = 0
-    other_count = 1  # Mark our test file as "other"
+    other_count = 0
+    
+    # Extract metrics using regex
+    total_match = re.search(r'TOTAL_REFS:\s*(\d+)', content)
+    if total_match:
+        total_refs = int(total_match.group(1))
+    
+    in_network_match = re.search(r'IN_NETWORK:\s*(\d+)', content)
+    if in_network_match:
+        in_network_count = int(in_network_match.group(1))
+    
+    allowed_amount_match = re.search(r'ALLOWED_AMOUNT:\s*(\d+)', content)
+    if allowed_amount_match:
+        allowed_amount_count = int(allowed_amount_match.group(1))
+    
+    other_match = re.search(r'OTHER:\s*(\d+)', content)
+    if other_match:
+        other_count = int(other_match.group(1))
     
     # Log results
     context['ti'].xcom_push(key='total_file_refs', value=total_refs)
     context['ti'].xcom_push(key='file_content', value=content[:1000])  # First 1000 chars
     
-    print(f"✅ TESTING MODE: Successfully verified file creation")
-    print(f"File contents: {content}")
-    print(f"This is a placeholder for actual file reference extraction")
-    print(f"In production, this task would count and categorize file references")
+    print(f"✅ Extraction verification complete. Found {total_refs} total file references.")
+    print(f"  - In-network files: {in_network_count}")
+    print(f"  - Allowed amount files: {allowed_amount_count}")
+    print(f"  - Other files: {other_count}")
     
-    # In test mode, use placeholder URLs
+    # Extract sample URLs
     sample_urls = []
+    sample_section = False
+    for line in content.split('\n'):
+        if line.strip() == "SAMPLES:":
+            sample_section = True
+            continue
+        
+        if sample_section and re.match(r'\d+\.\s+', line):
+            url = re.sub(r'^\d+\.\s+', '', line).strip()
+            if url and not url.startswith("SAMPLE"):
+                sample_urls.append(url)
+    
     context['ti'].xcom_push(key='sample_urls', value=str(sample_urls))
     
     # Print sample URLs
-    print(f"\nSample URLs: None in test mode")
+    print(f"\nSample URLs (first 5):")
+    for i, url in enumerate(sample_urls[:5]):
+        print(f"  {i+1}. {url}")
     
-    # Don't fail in development/testing mode
+    # If we didn't find any references, warn but don't fail
+    if total_refs == 0:
+        print("WARNING: No file references found! Check the extraction process.")
+    
     return total_refs
 
 verify_task = PythonOperator(
@@ -197,20 +357,42 @@ verify_task = PythonOperator(
 # Task 5: Process files using individual workers (simplified placeholder for now)
 def process_files(**context):
     """Process the extracted file references into meaningful data."""
-    # Get the file content from the previous task
+    # Get the total count of file references and sample URLs from the previous task
     total_refs = context['ti'].xcom_pull(task_ids='verify_extraction', key='total_file_refs')
-    file_content = context['ti'].xcom_pull(task_ids='verify_extraction', key='file_content')
+    sample_urls = context['ti'].xcom_pull(task_ids='verify_extraction', key='sample_urls')
     
-    print(f"✅ TESTING MODE: Successfully completed extraction process")
-    print(f"File contents: {file_content}")
-    print("\nIn production, this task would:")
-    print("1. Download each referenced file from its URL")
-    print("2. Parse the file content based on file type (JSON, CSV, etc.)")
-    print("3. Transform the data into a standard format")
-    print("4. Write to Iceberg tables using Hadoop, Spark, and Iceberg components")
-    print("   - This maintains a cloud-agnostic approach using standard components")
-    print("   - Apache Iceberg provides table format independence from specific cloud services")
-    print("   - The data processing can run on any environment with Hadoop/Spark support")
+    print(f"✅ Successfully extracted {total_refs} file references for processing")
+    
+    try:
+        # Convert string representation back to list
+        import ast
+        if isinstance(sample_urls, str):
+            sample_urls = ast.literal_eval(sample_urls)
+        
+        # Show sample of URLs that would be processed
+        print("\nSample files that would be processed:")
+        for i, url in enumerate(sample_urls[:5]):
+            print(f"  {i+1}. {url}")
+    except Exception as e:
+        print(f"Error processing sample URLs: {str(e)}")
+    
+    # Outline next steps in the cloud-agnostic Iceberg processing pipeline
+    print("\nNext steps in the data processing pipeline:")
+    print("1. Download each file from its URL using standard HTTP/HTTPS libraries")
+    print("2. Parse the content based on file type (JSON, CSV, etc.)")
+    print("3. Transform the data into a standardized format")
+    print("4. Write to Apache Iceberg tables")
+    print("   - Using standard Hadoop/Spark/Iceberg components")
+    print("   - This approach maintains cloud provider independence")
+    print("   - Data can be processed on any environment with the right components")
+    print("   - No reliance on proprietary cloud services")
+    
+    # Print distribution summary
+    print(f"\nProcessing Summary:")
+    print(f"  - Total file references: {total_refs}")
+    print(f"  - These will be processed in batches for optimal performance")
+    print(f"  - Results will be stored in Apache Iceberg tables on S3")
+    print(f"  - This maintains metadata in the Iceberg format rather than in proprietary catalogs")
     
     return total_refs
 
