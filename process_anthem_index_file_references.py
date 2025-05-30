@@ -206,9 +206,8 @@ def verify_extraction(**context):
     return total_refs
 
 verify_task = PythonOperator(
-    task_id='verify_extraction',
+    task_id='verify_extraction',git 
     python_callable=verify_extraction,
-    provide_context=True,
     dag=dag
 )
 
