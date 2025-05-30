@@ -77,7 +77,7 @@ config = {
 }
 
 # Task 1: Check if the index file exists (Optional during development/testing)
-from airflow.operators.dummy import DummyOperator
+from airflow.operators.empty import EmptyOperator  # Updated import for newer Airflow versions
 
 # Set these to False to skip S3 operations during development/testing
 USE_S3_SENSOR = False
@@ -94,8 +94,8 @@ if USE_S3_SENSOR:
         dag=dag
     )
 else:
-    # Use a dummy operator during development to bypass S3 check
-    check_index_file = DummyOperator(
+    # Use an empty operator during development to bypass S3 check - maintains cloud-agnostic approach
+    check_index_file = EmptyOperator(
         task_id='check_index_file',
         dag=dag
     )
