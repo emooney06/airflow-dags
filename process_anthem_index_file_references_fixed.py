@@ -14,6 +14,8 @@ from airflow.operators.python import PythonOperator
 from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
 from airflow.models import Variable
 import os
+import re
+import ast
 import boto3
 
 # Default arguments
@@ -37,6 +39,7 @@ dag = DAG(
     catchup=False,
     tags=['price-transparency', 'anthem', 'iceberg'],
 )
+
 # Configuration - Centralize all config here for easy updates
 config = {
     # S3 paths
@@ -149,7 +152,7 @@ import sys
 try:
     s3 = boto3.client('s3')
     buckets = s3.list_buckets()
-    print('✅ S3 access test successful. Found', len(buckets.get(\'Buckets\')), 'buckets')
+    print('✅ S3 access test successful. Found', len(buckets.get('Buckets')), 'buckets')
 except Exception as e:
     print(f'❌ S3 access test failed: {str(e)}')
     sys.exit(1)
@@ -175,34 +178,33 @@ python3 /home/airflow/anthem-processing/extract_anthem_file_references.py \
   --catalog-name anthem_catalog \
   --file-refs-table anthem_file_refs
 
-# Create a summary file of what was extracted
-cat > /home/airflow/anthem_file_references.txt << EOT
-# Summary of Anthem file reference extraction
-# Generated: $(date)
-
-# To see full details of the extraction, check the Iceberg table: anthem_catalog.anthem_file_refs
-# This is using the cloud-agnostic Apache Iceberg format rather than proprietary services
-
-# Query the table for statistics:
-# spark.sql("SELECT file_type, COUNT(*) FROM anthem_catalog.anthem_file_refs GROUP BY file_type").show()
-
-# To access individual files:
-# spark.sql("SELECT * FROM anthem_catalog.anthem_file_refs LIMIT 10").show()
-EOT
-
-# Also create a categorized output file for the Airflow DAG to process
+# Create a summary file of the extraction
+# This captures Iceberg table info in a format the verify task can read
 spark-shell --conf spark.sql.catalog.anthem_catalog=org.apache.iceberg.spark.SparkCatalog \
            --conf spark.sql.catalog.anthem_catalog.type=hadoop \
            --conf spark.sql.catalog.anthem_catalog.warehouse=s3a://price-transparency-raw/warehouse \
            -c "
+import org.apache.spark.sql.functions._
+
+// Get counts by network type
 val counts = spark.sql(\"SELECT file_network, COUNT(*) as count FROM anthem_catalog.anthem_file_refs GROUP BY file_network\").collect()
+val totalCount = counts.map(_.getLong(1)).sum
+
+// Get some sample URLs
 val sample = spark.sql(\"SELECT file_network, file_url FROM anthem_catalog.anthem_file_refs LIMIT 10\").collect()
 
-val fw = new java.io.FileWriter(\"/home/airflow/anthem_file_references.txt\", true)
+// Write to the output file
+val fw = new java.io.FileWriter(\"/home/airflow/anthem_file_references.txt\")
 try {
-  fw.write(\"\\nTOTAL_REFS: \" + counts.map(_.getLong(1)).sum + \"\\n\")
-  counts.foreach(row => fw.write(row.getString(0).toUpperCase + \": \" + row.getLong(1) + \"\\n\"))
+  fw.write(\"TOTAL_REFS: \" + totalCount + \"\\n\")
   
+  // Write counts for each network type
+  counts.foreach { row =>
+    val networkType = if (row.getString(0) == null || row.getString(0).isEmpty) \"OTHER\" else row.getString(0).toUpperCase
+    fw.write(networkType + \": \" + row.getLong(1) + \"\\n\")
+  }
+  
+  // Write sample URLs
   fw.write(\"\\nSAMPLES:\\n\")
   sample.zipWithIndex.foreach { case (row, i) => 
     fw.write((i+1) + \". \" + row.getString(1) + \"\\n\")
@@ -211,288 +213,15 @@ try {
   fw.close()
 }
 
-println(\"✅ Summary file updated with counts and sample URLs\")
+println(\"✅ Wrote summary with \" + totalCount + \" total references\")
 "
 
 echo "==== Extraction completed at $(date) ===="
 '''
 
-def log(message):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_line = f"[{timestamp}] {message}"
-    print(log_line)
-    try:
-        with open(LOG_FILE, "a") as f:
-            f.write(log_line + "\n")
-    except Exception as e:
-        print(f"Error writing to log: {e}")
-
-# Set paths
-INDEX_FILE = "s3a://price-transparency-raw/payer/anthem/index_files/main-index/2025-05-01_anthem_index.json.gz"
-OUTPUT_FILE = "/home/airflow/anthem_file_references.txt"
-
-# File reference patterns
-URL_PATTERNS = [
-    r'"in_network_files"\s*:\s*\[\s*"([^"]+)"',
-    r'"allowed_amount_files"\s*:\s*\[\s*"([^"]+)"',
-    r'"url"\s*:\s*"([^"]+\.(?:json|csv|parquet|gz))"',
-    r'https?://[^"\s]+\.(?:json|csv|parquet|gz)'
-]
-
-def test_s3_access():
-    """Test S3 connectivity and permissions"""
-    try:
-        log("Testing S3 connectivity...")
-        s3 = boto3.client('s3')
-        buckets = s3.list_buckets()
-        log(f"Successfully connected to S3. Found {len(buckets.get('Buckets', []))} buckets")
-        
-        # Try to list objects in target bucket
-        parsed = urlparse(INDEX_FILE.replace("s3a://", "s3://"))
-        bucket = parsed.netloc
-        prefix = parsed.path.lstrip("/").split("/")[0]  # Get top-level directory
-        
-        log(f"Testing access to bucket '{bucket}' with prefix '{prefix}'...")
-        try:
-            response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=5)
-            if 'Contents' in response:
-                log(f"Successfully listed objects in {bucket}/{prefix}")
-                for obj in response.get('Contents', [])[:3]:
-                    log(f"  - {obj['Key']} ({obj['Size']} bytes)")
-                return True
-            else:
-                log(f"No objects found in {bucket}/{prefix} or access denied")
-                return False
-        except Exception as e:
-            log(f"Error listing bucket contents: {e}")
-            return False
-            
-    except Exception as e:
-        log(f"S3 connection test failed: {e}")
-        traceback.print_exc(file=open(LOG_FILE, "a"))
-        return False
-
-def main():
-    try:
-        # Initialize log file
-        with open(LOG_FILE, "w") as f:
-            f.write(f"=== Anthem Index Extraction - Started {datetime.now()} ===\n")
-        
-        log("Starting Anthem index file extraction")
-        start_time = time.time()
-        
-        # First test S3 connectivity
-        if not test_s3_access():
-            log("⚠️ S3 connectivity test failed. Check AWS credentials and permissions.")
-            with open(OUTPUT_FILE, "w") as f:
-                f.write("ERROR: S3 connectivity test failed\n")
-            return 1
-        
-        # Parse S3 URL
-        parsed = urlparse(INDEX_FILE.replace("s3a://", "s3://"))
-        bucket = parsed.netloc
-        key = parsed.path.lstrip("/")
-        
-        # Initialize S3 client
-        s3 = boto3.client("s3")
-        
-        # Check if file exists and get metadata
-        try:
-            head_response = s3.head_object(Bucket=bucket, Key=key)
-            file_size = head_response.get('ContentLength', 0)
-            log(f"✅ Successfully accessed index file. Size: {file_size/1024/1024:.2f} MB")
-        except Exception as e:
-            log(f"❌ Error accessing index file: {e}")
-            with open(OUTPUT_FILE, "w") as f:
-                f.write(f"ERROR: Cannot access index file: {e}\n")
-            return 1
-        
-        # Force processing to take longer for testing
-        log("💤 Sleeping for 30 seconds to simulate longer processing...")
-        time.sleep(30)  # Increased to 30 seconds to ensure DAG runs longer
-        
-        # Read file in chunks
-        references = []
-        offset = 0
-        chunk_size = 10 * 1024 * 1024  # 10MB chunks
-        max_chunks = 20  # Process up to 200MB to ensure we get data
-        chunks_processed = 0
-        
-        for chunk_num in range(max_chunks):
-            chunk_start = time.time()
-            try:
-                # Get range of bytes
-                range_header = f"bytes={offset}-{offset+chunk_size-1}"
-                log(f"📥 Requesting chunk {chunk_num+1}: {range_header}")
-                
-                response = s3.get_object(Bucket=bucket, Key=key, Range=range_header)
-                chunk_data = response["Body"].read()
-                
-                if not chunk_data:
-                    log("End of file reached (empty response)")
-                    break
-                    
-                log(f"Received {len(chunk_data)/1024/1024:.2f} MB of data")
-                
-                # Decompress if gzipped
-                decompressed_size = 0
-                if key.endswith(".gz"):
-                    try:
-                        decompress_start = time.time()
-                        chunk_data = gzip.decompress(chunk_data)
-                        decompressed_size = len(chunk_data)
-                        log(f"Decompressed to {decompressed_size/1024/1024:.2f} MB in {time.time()-decompress_start:.2f}s")
-                    except Exception as e:
-                        log(f"⚠️ Warning: Could not decompress chunk {chunk_num+1}: {e}")
-                
-                # Convert to string and find patterns
-                decode_start = time.time()
-                chunk_str = chunk_data.decode("utf-8", errors="replace")
-                log(f"Decoded chunk to {len(chunk_str)} characters in {time.time()-decode_start:.2f}s")
-                
-                # Show sample of first chunk for debugging
-                if chunk_num == 0:
-                    sample = chunk_str[:200]
-                    log(f"Sample of first chunk: {sample}...")
-                
-                # Extract URLs using regex patterns
-                pattern_start = time.time()
-                chunk_refs = []
-                for pattern in URL_PATTERNS:
-                    matches = re.findall(pattern, chunk_str)
-                    if matches:
-                        log(f"Found {len(matches)} matches with pattern {pattern[:20]}...")
-                        if len(matches) > 0 and chunk_num == 0:
-                            log(f"Sample match: {matches[0][:100]}")
-                    chunk_refs.extend(matches)
-                
-                log(f"Extracted {len(chunk_refs)} references in {time.time()-pattern_start:.2f}s")
-                references.extend(chunk_refs)
-                
-                # Move to next chunk
-                offset += len(chunk_data)
-                chunks_processed += 1
-                
-                # Log chunk processing stats
-                chunk_time = time.time() - chunk_start
-                log(f"✅ Processed chunk {chunk_num+1} in {chunk_time:.2f}s. Total references: {len(references)}")
-                
-                # If this chunk was smaller than requested, we've reached EOF
-                if len(chunk_data) < chunk_size:
-                    log(f"End of file reached (smaller chunk than requested)")
-                    break
-                
-                # Process at least 2 chunks for demo
-                if chunks_processed >= 2:
-                    log("Processed 2 chunks, stopping for demo purposes")
-                    break
-                    
-            except Exception as e:
-                log(f"❌ Error processing chunk {chunk_num+1}: {e}")
-                traceback.print_exc(file=open(LOG_FILE, "a"))
-                if chunk_num > 0:  # Only break if we've processed at least one chunk
-                    break
-                else:
-                    with open(OUTPUT_FILE, "w") as f:
-                        f.write(f"ERROR: Failed to process file: {e}\n")
-                    return 1
-        
-        # If we didn't process any chunks successfully
-        if chunks_processed == 0:
-            log("Failed to process any chunks successfully")
-            with open(OUTPUT_FILE, "w") as f:
-                f.write("ERROR: Failed to process any data chunks\n")
-            return 1
-        
-        # Remove duplicates
-        unique_refs = list(set(references))
-        log(f"🔍 Found {len(references)} total references, {len(unique_refs)} unique")
-        
-        # Categorize references
-        in_network = [ref for ref in unique_refs if "in-network" in ref.lower()]
-        allowed_amount = [ref for ref in unique_refs if "allowed-amount" in ref.lower()]
-        other = [ref for ref in unique_refs if "in-network" not in ref.lower() and "allowed-amount" not in ref.lower()]
-        
-        log(f"📊 Categories: {len(in_network)} in-network, {len(allowed_amount)} allowed-amount, {len(other)} other")
-        
-        # Save results
-        with open(OUTPUT_FILE, "w") as f:
-            f.write(f"TOTAL_REFS: {len(unique_refs)}\n")
-            f.write(f"IN_NETWORK: {len(in_network)}\n")
-            f.write(f"ALLOWED_AMOUNT: {len(allowed_amount)}\n")
-            f.write(f"OTHER: {len(other)}\n")
-            f.write(f"CHUNKS_PROCESSED: {chunks_processed}\n\n")
-            
-            # Write sample of each type
-            f.write("SAMPLES:\n")
-            
-            if in_network:
-                f.write("\nIN-NETWORK SAMPLES:\n")
-                for i, ref in enumerate(in_network[:10]):
-                    f.write(f"{i+1}. {ref}\n")
-                    
-            if allowed_amount:
-                f.write("\nALLOWED-AMOUNT SAMPLES:\n")
-                for i, ref in enumerate(allowed_amount[:10]):
-                    f.write(f"{i+1}. {ref}\n")
-                    
-            if other:
-                f.write("\nOTHER SAMPLES:\n")
-                for i, ref in enumerate(other[:10]):
-                    f.write(f"{i+1}. {ref}\n")
-        
-        total_time = time.time() - start_time
-        log(f"✅ Extraction complete! Processed in {total_time:.2f}s")
-        log(f"📄 Results written to {OUTPUT_FILE}")
-        log(f"📊 Found {len(unique_refs)} unique file references")
-        return 0
-        
-    except Exception as e:
-        log(f"❌ Error in main process: {e}")
-        traceback.print_exc(file=open(LOG_FILE, "a"))
-        
-        # Write error to output file for Airflow to read
-        with open(OUTPUT_FILE, "w") as f:
-            f.write(f"ERROR: {e}\n")
-        return 1
-
-if __name__ == "__main__":
-    sys.exit(main())
-EOF
-
-# Run the extraction script with timing information
-echo "==== STARTING EXTRACTION $(date) ====" 
-time python3 /home/airflow/anthem-processing/extract_refs.py
-EXTRACTION_STATUS=$?
-
-# Show the log file and results
-echo "\n==== EXTRACTION LOG (last 20 lines) ====" 
-tail -n 20 /home/airflow/anthem_extraction.log
-
-echo "\n==== EXTRACTION RESULTS ====" 
-cat /home/airflow/anthem_file_references.txt || echo "Could not display output file"
-
-echo "\n==== EXTRACTION PROCESS COMPLETED WITH EXIT CODE: $EXTRACTION_STATUS ====" 
-
-# Return the extraction status code
-exit $EXTRACTION_STATUS
-
-# Show the results summary
-echo "=== EXTRACTION RESULTS ==="
-head -n 20 /home/airflow/anthem_file_references.txt || echo "Could not display output file"
-'''
-
 extract_file_refs = BashOperator(
     task_id='extract_file_references',
     bash_command=extract_file_refs_script,
-    params={
-        's3_path': f"s3a://{config['s3_bucket']}/{config['index_file_key']}",
-        'warehouse': config['warehouse_location'],
-        'catalog': config['catalog_name'],
-        'table': config['file_refs_table'],
-        'batch_size': config['batch_size'],
-        'max_records': config['max_records']
-    },
     dag=dag
 )
 
@@ -528,11 +257,11 @@ def verify_extraction(**context):
     if total_match:
         total_refs = int(total_match.group(1))
     
-    in_network_match = re.search(r'IN_NETWORK:\s*(\d+)', content)
+    in_network_match = re.search(r'IN[_-]NETWORK:\s*(\d+)', content)
     if in_network_match:
         in_network_count = int(in_network_match.group(1))
     
-    allowed_amount_match = re.search(r'ALLOWED_AMOUNT:\s*(\d+)', content)
+    allowed_amount_match = re.search(r'ALLOWED[_-]AMOUNT:\s*(\d+)', content)
     if allowed_amount_match:
         allowed_amount_count = int(allowed_amount_match.group(1))
     
@@ -581,7 +310,7 @@ verify_task = PythonOperator(
     dag=dag
 )
 
-# Task 5: Process files using individual workers (simplified placeholder for now)
+# Task 5: Process files using individual workers
 def process_files(**context):
     """Process the extracted file references into meaningful data."""
     # Get the total count of file references and sample URLs from the previous task
@@ -592,7 +321,6 @@ def process_files(**context):
     
     try:
         # Convert string representation back to list
-        import ast
         if isinstance(sample_urls, str):
             sample_urls = ast.literal_eval(sample_urls)
         
