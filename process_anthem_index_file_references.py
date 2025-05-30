@@ -186,9 +186,11 @@ def main():
         
         # Save results
         with open(args.output_file, 'w') as f:
-            f.write("Found " + str(len(references)) + " file references\n")
+            f.write("Found " + str(len(references)) + " file references")
+            f.write("\n")  # Add newline separately
             for i, ref in enumerate(references[:100]):  # Show first 100 only
-                f.write(str(i+1) + ". " + str(ref) + "\n")
+                f.write(str(i+1) + ". " + str(ref))
+                f.write("\n")  # Add newline separately
         
         print("✅ Extracted " + str(len(references)) + " file references to " + args.output_file)
         return 0
