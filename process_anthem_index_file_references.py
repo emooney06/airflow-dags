@@ -51,8 +51,8 @@ config = {
     'file_refs_table': 'anthem_file_refs',
     'processed_table': 'anthem_data',
     
-    # Environment setup
-    'jars_path': '/home/ec2-user/iceberg-jars:/home/ec2-user/hadoop-aws-jars',
+    # Environment setup - use Airflow home directory
+    'jars_path': '/home/airflow/iceberg-jars:/home/airflow/hadoop-aws-jars',
     
     # Processing parameters
     'batch_size': 10000,
@@ -105,119 +105,114 @@ setup_env = BashOperator(
 )
 
 # Task 3: Extract file references and save to Iceberg table
-# For development/testing purposes, use the PythonOperator instead of BashOperator
-# This allows us to mock the extraction in the Airflow environment
-
-def mock_extract_file_references(**context):
-    """Mock extraction function for Airflow development/testing"""
-    import time
-    import random
-    
-    # Log the parameters we would use
-    s3_path = f"s3a://{config['s3_bucket']}/{config['index_file_key']}"
-    warehouse = config['warehouse_location']
-    catalog = config['catalog_name']
-    table = config['file_refs_table']
-    
-    print(f"📋 Extracting file references from: {s3_path}")
-    print(f"📋 Writing to Iceberg table: {catalog}.{table}")
-    print(f"📋 Warehouse location: {warehouse}")
-    
-    # Simulate processing time
-    total_refs = 0
-    for i in range(5):
-        # Simulate finding references
-        refs_found = random.randint(5000, 15000)
-        total_refs += refs_found
-        print(f"💾 Batch {i+1}: Found {refs_found} file references...")
-        time.sleep(2)  # Small delay for logging to appear
-    
-    print(f"✅ Extraction complete! Processed {total_refs} file references")
-    
-    # Push metrics to XCom
-    context['ti'].xcom_push(key='total_file_refs', value=total_refs)
-    context['ti'].xcom_push(key='extraction_successful', value=True)
-    
-    return total_refs
-
-# Use PythonOperator for the mock extraction
-from airflow.operators.python import PythonOperator
-
-extract_file_refs = PythonOperator(
-    task_id='extract_file_references',
-    python_callable=mock_extract_file_references,
-    dag=dag
-)
-
-# Comment out the original BashOperator for now
-'''
-BashOperator version - for use on actual EC2 instances with proper setup:
-
 extract_file_refs_script = """
 #!/bin/bash
-# Create a local directory for extraction scripts
-mkdir -p /tmp/anthem-processing
 
-# Set environment variables for PySpark
-export PYSPARK_SUBMIT_ARGS="--packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.4.2 pyspark-shell"
+# Create necessary directories
+mkdir -p /home/airflow/iceberg-jars /home/airflow/hadoop-aws-jars /home/airflow/anthem-processing
 
-INDEX_FILE="{{ params.s3_path }}"
-WAREHOUSE="{{ params.warehouse }}"
-CATALOG="{{ params.catalog }}"
-TABLE="{{ params.table }}"
-BATCH_SIZE="{{ params.batch_size }}"
-{% if params.max_records %}
-MAX_RECORDS="--max-records {{ params.max_records }}"
-{% else %}
-MAX_RECORDS=""
-{% endif %}
+# Check and download Hadoop AWS JARs if needed
+if [ ! -f "/home/airflow/hadoop-aws-jars/hadoop-aws-3.3.4.jar" ]; then
+    echo "Downloading Hadoop AWS JARs..."
+    wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar -P /home/airflow/hadoop-aws-jars/
+    wget -q https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar -P /home/airflow/hadoop-aws-jars/
+    wget -q https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-common/3.3.4/hadoop-common-3.3.4.jar -P /home/airflow/hadoop-aws-jars/
+fi
 
-# Create a simple test extraction script
-cat > /tmp/anthem-processing/test_extraction.py << 'EOF'
-import time
-import random
+# Check and download Iceberg JARs if needed
+if [ ! -f "/home/airflow/iceberg-jars/iceberg-spark-runtime-3.5_2.12-1.4.2.jar" ]; then
+    echo "Downloading Iceberg JARs..."
+    wget -q https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.4.2/iceberg-spark-runtime-3.5_2.12-1.4.2.jar -P /home/airflow/iceberg-jars/
+    wget -q https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.4.2/iceberg-aws-bundle-1.4.2.jar -P /home/airflow/iceberg-jars/
+fi
+
+# Create a simple Python script to extract file references
+cat > /home/airflow/anthem-processing/extract_files.py << 'EOF'
 import sys
+import os
+import boto3
+import json
+import gzip
+import re
+from datetime import datetime
+from urllib.parse import urlparse
 
-def mock_extract(index_file, warehouse, catalog, table):
-    """Mock extraction for testing the Airflow pipeline"""
-    print(f"📋 Extracting file references from: {index_file}")
-    print(f"📋 Writing to Iceberg table: {catalog}.{table}")
-    print(f"📋 Warehouse location: {warehouse}")
-    
-    # Simulate processing
-    total_refs = 0
-    for i in range(5):
-        refs_found = random.randint(5000, 15000)
-        total_refs += refs_found
-        print(f"💾 Batch {i+1}: Found {refs_found} file references...")
-        time.sleep(1)
-    
-    print(f"✅ Extraction complete! Processed {total_refs} file references")
-    return total_refs
-
-if __name__ == "__main__":
+def main():
+    # Parse command-line arguments
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--index-file", required=True)
-    parser.add_argument("--warehouse-location", required=True)
-    parser.add_argument("--catalog-name", required=True)
-    parser.add_argument("--file-refs-table", required=True)
+    parser = argparse.ArgumentParser(description='Extract file references from Anthem index')
+    parser.add_argument('--index-file', required=True, help='S3 path to the index file')
+    parser.add_argument('--output-file', required=True, help='Path to save extracted references')
+    parser.add_argument('--max-records', type=int, default=None, help='Max records to extract')
     args = parser.parse_args()
     
-    mock_extract(
-        args.index_file,
-        args.warehouse_location,
-        args.catalog_name,
-        args.file_refs_table
-    )
+    # Download a small sample of the file for testing
+    print(f"Processing index file: {args.index_file}")
+    s3 = boto3.client('s3')
+    parsed = urlparse(args.index_file.replace('s3a://', 's3://'))
+    bucket = parsed.netloc
+    key = parsed.path.lstrip('/')
+    
+    # Test credentials and bucket access
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        print(f"✅ Successfully accessed {args.index_file}")
+    except Exception as e:
+        print(f"❌ Error accessing index file: {str(e)}")
+        sys.exit(1)
+    
+    # For test purposes, only download first part of the file
+    response = s3.get_object(Bucket=bucket, Key=key, Range='bytes=0-1048576')
+    content = response['Body'].read()
+    
+    # Process file content
+    try:
+        if key.endswith('.gz'):
+            content = gzip.decompress(content)
+        
+        content_str = content.decode('utf-8', errors='replace')
+        
+        # Find URLs in the file
+        url_patterns = [
+            r'"in_network_files"\s*:\s*\[\s*"([^"]+)"',
+            r'"allowed_amount_files"\s*:\s*\[\s*"([^"]+)"',
+            r'"url"\s*:\s*"([^"]+\.(?:json|csv|parquet|gz))"',
+            r'https?://[^"\s]+\.(?:json|csv|parquet|gz)'
+        ]
+        
+        references = []
+        for pattern in url_patterns:
+            references.extend(re.findall(pattern, content_str))
+        
+        # Save results
+        with open(args.output_file, 'w') as f:
+            f.write(f"Found {len(references)} file references\n")
+            for i, ref in enumerate(references[:100]):  # Show first 100 only
+                f.write(f"{i+1}. {ref}\n")
+        
+        print(f"✅ Extracted {len(references)} file references to {args.output_file}")
+        return 0
+    except Exception as e:
+        print(f"❌ Error processing file: {str(e)}")
+        return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
 EOF
 
-# Run the mock extraction
-python3 /tmp/anthem-processing/test_extraction.py \
+# Run the extraction script with Airflow's Python
+INDEX_FILE="{{ params.s3_path }}"
+OUTPUT_FILE="/home/airflow/anthem_file_references.txt"
+
+# Run the Python script
+python3 /home/airflow/anthem-processing/extract_files.py \
   --index-file "$INDEX_FILE" \
-  --warehouse-location "$WAREHOUSE" \
-  --catalog-name "$CATALOG" \
-  --file-refs-table "$TABLE"
+  --output-file "$OUTPUT_FILE" \
+  {% if params.max_records %}--max-records {{ params.max_records }}{% endif %}
+
+# Show the results
+echo "=== EXTRACTION RESULTS ==="
+cat "$OUTPUT_FILE"
 """
 
 extract_file_refs = BashOperator(
@@ -233,58 +228,58 @@ extract_file_refs = BashOperator(
     },
     dag=dag
 )
-'''
 
 # Task 4: Verify extraction results
 def verify_extraction(**context):
-    """Verify the extracted file references and log summary statistics."""
-    from pyspark.sql import SparkSession
-    import findspark
-    findspark.init()
-
-    # Initialize Spark session
-    spark = (SparkSession.builder
-             .appName("Verify Anthem Extraction")
-             .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
-             .config(f"spark.sql.catalog.{config['catalog_name']}", "org.apache.iceberg.spark.SparkCatalog")
-             .config(f"spark.sql.catalog.{config['catalog_name']}.type", "hadoop")
-             .config(f"spark.sql.catalog.{config['catalog_name']}.warehouse", config['warehouse_location'])
-             .config("spark.jars.packages", "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.4.2")
-             .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-             .config("spark.hadoop.fs.s3a.aws.credentials.provider", "com.amazonaws.auth.DefaultAWSCredentialsProviderChain")
-             .getOrCreate())
-
-    # Get row count
-    count_df = spark.sql(f"SELECT COUNT(*) as total_refs FROM {config['catalog_name']}.{config['file_refs_table']}")
-    total_refs = count_df.collect()[0]['total_refs']
+    """Verify the extracted file references from the output file."""
+    import os
     
-    # Get distribution by file type
-    type_distribution = spark.sql(f"""
-    SELECT file_type, COUNT(*) as count 
-    FROM {config['catalog_name']}.{config['file_refs_table']} 
-    GROUP BY file_type 
-    ORDER BY count DESC
-    """).collect()
+    output_file = "/home/airflow/anthem_file_references.txt"
+    
+    # Check if the output file exists
+    if not os.path.exists(output_file):
+        raise ValueError(f"Output file not found: {output_file}")
+    
+    # Read and analyze the file
+    with open(output_file, 'r') as f:
+        content = f.read()
+    
+    # Extract basic statistics
+    first_line = content.split('\n')[0]
+    total_refs = 0
+    if "Found " in first_line and " file references" in first_line:
+        try:
+            total_refs = int(first_line.split("Found ")[1].split(" file")[0])
+        except:
+            total_refs = len(content.split('\n')) - 1  # Estimate from line count
+    
+    # Count by type
+    in_network_count = content.count('in-network')
+    allowed_amount_count = content.count('allowed-amount')
+    other_count = total_refs - in_network_count - allowed_amount_count
     
     # Log results
     context['ti'].xcom_push(key='total_file_refs', value=total_refs)
-    context['ti'].xcom_push(key='type_distribution', value=str(type_distribution))
+    context['ti'].xcom_push(key='file_content', value=content[:1000])  # First 1000 chars
     
-    # Log sample URLs
-    sample_urls = spark.sql(f"""
-    SELECT file_type, file_url 
-    FROM {config['catalog_name']}.{config['file_refs_table']} 
-    ORDER BY file_type 
-    LIMIT 5
-    """).collect()
+    print(f"✅ Extraction verification complete. Found {total_refs} total file references.")
+    print(f"  - In-network files: ~{in_network_count}")
+    print(f"  - Allowed amount files: ~{allowed_amount_count}")
+    print(f"  - Other files: ~{other_count}")
+    
+    # Get sample URLs
+    sample_urls = []
+    for line in content.split('\n')[1:11]:  # Get up to 10 sample URLs
+        if ". " in line:
+            url = line.split(". ", 1)[1].strip()
+            sample_urls.append(url)
     
     context['ti'].xcom_push(key='sample_urls', value=str(sample_urls))
     
-    print(f"✅ Extraction verification complete. Found {total_refs} total file references.")
-    for row in type_distribution:
-        print(f"  - {row['file_type']}: {row['count']} files")
-    
-    spark.stop()
+    # Print sample URLs
+    print(f"\nSample URLs (first 3):")
+    for i, url in enumerate(sample_urls[:3]):
+        print(f"  {i+1}. {url}")
     
     # If we didn't find any references, fail the task
     if total_refs == 0:
@@ -298,63 +293,39 @@ verify_task = PythonOperator(
     dag=dag
 )
 
-# Task 5: Process individual files (could be expanded into a dynamic task group)
-process_files_script = """
-#!/bin/bash
-# This is a placeholder for the actual processing of individual files
-# In a complete implementation, you'd loop through file references and process each
+# Task 5: Process files using individual workers (simplified placeholder for now)
+def process_files(**context):
+    """Process the extracted file references into meaningful data."""
+    # Get the total count of file references and sample URLs from the previous task
+    total_refs = context['ti'].xcom_pull(task_ids='verify_extraction', key='total_file_refs')
+    sample_urls = context['ti'].xcom_pull(task_ids='verify_extraction', key='sample_urls')
+    
+    print(f"✅ Found {total_refs} file references for processing")
+    
+    try:
+        # Convert string representation back to list
+        import ast
+        if isinstance(sample_urls, str):
+            sample_urls = ast.literal_eval(sample_urls)
+        
+        # Show sample of URLs that would be processed
+        print("\nSample files that would be processed:")
+        for i, url in enumerate(sample_urls[:5]):
+            print(f"  {i+1}. {url}")
+    except Exception as e:
+        print(f"Error processing sample URLs: {str(e)}")
+    
+    print("\nNext steps would be to:")
+    print("1. Download each file from its URL")
+    print("2. Parse the content based on file type (JSON, CSV, etc.)")
+    print("3. Transform the data into a standard format")
+    print("4. Write to Iceberg tables for analytics")
+    
+    return total_refs
 
-export PYSPARK_SUBMIT_ARGS="--jars /home/ec2-user/hadoop-aws-jars/hadoop-aws-3.3.4.jar,/home/ec2-user/hadoop-aws-jars/aws-java-sdk-bundle-1.12.262.jar,/home/ec2-user/hadoop-aws-jars/hadoop-common-3.3.4.jar,/home/ec2-user/iceberg-jars/iceberg-spark-runtime-3.5_2.12-1.4.2.jar,/home/ec2-user/iceberg-jars/iceberg-aws-bundle-1.4.2.jar --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.4.2 pyspark-shell"
-
-# Get a sample of files to process (for testing)
-python - << EOF
-import findspark
-findspark.init()
-
-from pyspark.sql import SparkSession
-import os
-
-warehouse = "${params.warehouse}"
-catalog = "${params.catalog}"
-file_refs_table = "${params.file_refs_table}"
-processed_table = "${params.processed_table}"
-
-spark = (SparkSession.builder
-       .appName("Anthem File Processor")
-       .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
-       .config(f"spark.sql.catalog.{catalog}", "org.apache.iceberg.spark.SparkCatalog")
-       .config(f"spark.sql.catalog.{catalog}.type", "hadoop")
-       .config(f"spark.sql.catalog.{catalog}.warehouse", warehouse)
-       .config("spark.jars.packages", "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.4.2")
-       .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-       .config("spark.hadoop.fs.s3a.aws.credentials.provider", "com.amazonaws.auth.DefaultAWSCredentialsProviderChain")
-       .getOrCreate())
-
-# Get sample of files to process
-sample = spark.sql(f"SELECT file_type, file_url FROM {catalog}.{file_refs_table} LIMIT 10").collect()
-
-print(f"Would process {len(sample)} files:")
-for row in sample:
-    print(f"  - {row['file_type']}: {row['file_url']}")
-
-# In a real implementation, you would:
-# 1. Create target tables if needed
-# 2. Process each file based on its type
-# 3. Write the results to Iceberg tables
-
-spark.stop()
-EOF
-"""
-
-process_files = BashOperator(
+process_files_task = PythonOperator(
     task_id='process_files',
-    bash_command=process_files_script,
-    params={
-        'warehouse': config['warehouse_location'],
-        'catalog': config['catalog_name'],
-        'file_refs_table': config['file_refs_table'],
-        'processed_table': config['processed_table']
-    },
+    python_callable=process_files,
     dag=dag
 )
 
