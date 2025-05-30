@@ -41,7 +41,7 @@ dag = DAG(
 config = {
     # S3 paths
     's3_bucket': 'price-transparency-raw',
-    'index_file_key': 'payer/anthem/index_files/main-index/{{ execution_date.strftime("%Y-%m-%d") }}_anthem_index.json.gz',
+    'index_file_key': 'payer/anthem/index_files/main-index/{{ logical_date.strftime("%Y-%m-%d") }}_anthem_index.json.gz',
     'warehouse_location': 's3a://price-transparency-raw/warehouse',
     
     # Iceberg config
