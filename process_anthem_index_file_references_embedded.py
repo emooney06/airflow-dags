@@ -80,7 +80,7 @@ config = {
 check_index_file = S3KeySensor(
     task_id='check_index_file',
     bucket_key=config['index_file_key'],
-    bucket_name=config['s3_bucket'],
+    bucket_name=config['bucket_name'],
     aws_conn_id='aws_default',
     timeout=60 * 60 * 24,  # 24 hours timeout
     poke_interval=60 * 60,  # Check every 60 minutes
@@ -162,7 +162,7 @@ def setup_environment(**context):
         print(f"✅ Successfully connected to AWS. Found {len(buckets.get('Buckets', []))} buckets")
         
         # Try to list objects in target bucket
-        bucket = config['s3_bucket']
+        bucket = config['bucket_name']
         prefix = 'payer/anthem'
         
         response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=5)
@@ -222,7 +222,7 @@ def extract_file_references(**context):
             return 1
         
         # Parse S3 URL
-        s3_url = f"s3://{config['s3_bucket']}/{config['index_file_key']}"
+        s3_url = f"s3://{config['bucket_name']}/{config['index_file_key']}"
         parsed = urlparse(s3_url)
         bucket = parsed.netloc
         key = parsed.path.lstrip("/")
@@ -747,7 +747,7 @@ def test_s3_access():
         log_message(f"Successfully connected to S3. Found {len(buckets.get('Buckets', []))} buckets")
         
         # Try to list objects in target bucket
-        bucket = config['s3_bucket']
+        bucket = config['bucket_name']
         prefix = 'payer/anthem'
         
         log_message(f"Testing access to bucket '{bucket}' with prefix '{prefix}'...")
