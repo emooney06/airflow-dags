@@ -291,8 +291,7 @@ def setup_environment_task():
     os.environ['PYSPARK_SUBMIT_ARGS'] = f"--jars {jar_paths_str} pyspark-shell"
     logger.info(f"Set PYSPARK_SUBMIT_ARGS to: {os.environ['PYSPARK_SUBMIT_ARGS']}")
     
-    # Store jar_paths in context XCom for other tasks to use
-    context['ti'].xcom_push(key='jar_paths', value=jar_paths)
+    # jar_paths will be returned by this task for XComs.
     
     # Test S3 connectivity - only if we're using S3
     if USE_S3_FOR_DATA:
@@ -330,7 +329,7 @@ def setup_environment_task():
             f.write("Skipping S3 connectivity test, using local files for cloud-agnostic approach.\n")
     
     logger.info("Environment setup completed successfully")
-    return True
+    return jar_paths
 
 # Task 3: Extract file references and save to output file
 @task
@@ -677,3 +676,4 @@ def anthem_processing_tf_dag():
 
 # Instantiate the DAG
 anthem_dag_instance = anthem_processing_tf_dag()
+
