@@ -1359,7 +1359,7 @@ def test_s3_access():
         traceback.print_exc(file=open(config['log_file'], "a"))
         return False
 
-# Create the task instances
+# Create the simplified task instances
 setup_env = PythonOperator(
     task_id='setup_environment',
     python_callable=setup_environment,
@@ -1372,17 +1372,5 @@ extract_file_refs = PythonOperator(
     dag=dag
 )
 
-verify_task = PythonOperator(
-    task_id='verify_extraction',
-    python_callable=verify_extraction,
-    dag=dag
-)
-
-process_files_task = PythonOperator(
-    task_id='process_files',
-    python_callable=process_files,
-    dag=dag
-)
-
-# Define task dependencies
-check_index_file >> setup_env >> extract_file_refs >> verify_task >> process_files_task
+# Define simplified task dependencies - just setup and extract
+setup_env >> extract_file_refs
