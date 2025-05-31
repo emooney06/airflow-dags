@@ -163,14 +163,17 @@ def init_spark(**context):
              .config("spark.sql.catalog.spark_catalog.type", "hive")
              .config("spark.sql.parquet.compression.codec", "zstd")
              .config("spark.driver.memory", "4g")
-             .config("spark.executor.memory", "4g"))
+             .config("spark.executor.memory", "4g")
+    )
     
     # Add S3-specific configs only if using S3
     if USE_S3_FOR_DATA:
         builder = (builder
-             .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-             .config("spark.hadoop.fs.s3a.aws.credentials.provider", "com.amazonaws.auth.DefaultAWSCredentialsProviderChain")
-             .config("spark.hadoop.fs.s3a.path.style.access", "true"))
+            .config(f"spark.sql.catalog.{config['catalog_name']}.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+            .config(f"spark.sql.catalog.{config['catalog_name']}.default-namespace", "default")
+            .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+            .config("spark.hadoop.fs.s3a.aws.credentials.provider", "com.amazonaws.auth.DefaultAWSCredentialsProviderChain")
+            .config("spark.hadoop.fs.s3a.path.style.access", "true"))
     
     # Create the Spark session
     spark = builder.getOrCreate()
