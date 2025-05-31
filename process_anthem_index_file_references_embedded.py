@@ -84,9 +84,25 @@ config = {
             'path': os.path.join(os.path.expanduser('~/jars'), 'hadoop-aws-3.3.4.jar'),
             'url': 'https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar'
         },
-        'aws-java-sdk': {
+        'aws-java-sdk': { # This entry is conditionally skipped in init_spark if USE_S3_FOR_DATA is True
             'path': os.path.join(os.path.expanduser('~/jars'), 'aws-java-sdk-bundle-1.12.262.jar'),
             'url': 'https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar'
+        },
+        'hadoop-common': {
+            'path': os.path.join(os.path.expanduser('~/jars'), 'hadoop-common-3.3.4.jar'),
+            'url': 'https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-common/3.3.4/hadoop-common-3.3.4.jar'
+        },
+        'jackson-core': {
+            'path': os.path.join(os.path.expanduser('~/jars'), 'jackson-core-2.13.4.jar'),
+            'url': 'https://repo1.maven.org/maven2/com/fasterxml/jackson/core/jackson-core/2.13.4/jackson-core-2.13.4.jar'
+        },
+        'jackson-databind': {
+            'path': os.path.join(os.path.expanduser('~/jars'), 'jackson-databind-2.13.4.jar'),
+            'url': 'https://repo1.maven.org/maven2/com/fasterxml/jackson/core/jackson-databind/2.13.4/jackson-databind-2.13.4.jar'
+        },
+        'jackson-annotations': {
+            'path': os.path.join(os.path.expanduser('~/jars'), 'jackson-annotations-2.13.4.jar'),
+            'url': 'https://repo1.maven.org/maven2/com/fasterxml/jackson/core/jackson-annotations/2.13.4/jackson-annotations-2.13.4.jar'
         }
     }
 }
@@ -95,23 +111,33 @@ config = {
 def init_spark(**context):
     """Initialize Spark session with Iceberg support.
     Handles distinct configurations for S3/Glue and local Hadoop-style storage.
+    Configures Spark for robust local mode operation, including preferring IPv4.
     """
     import logging
     import os
+    # import socket # No longer attempting to auto-detect IP for local mode
     from pyspark.sql import SparkSession
 
     logger = logging.getLogger('airflow.task')
-    logger.info("Initializing Spark with Iceberg support...")
+    logger.info("Initializing Spark with Iceberg support for local execution (preferring IPv4)...")
 
     # JAR setup (download if needed)
     os.makedirs(config['jar_dir'], exist_ok=True)
     jar_paths = []
+    logger.info("Processing JAR dependencies...")
     for jar_name, jar_info in config['jar_files'].items():
+        # Conditionally skip aws_sdk bundle if USE_S3_FOR_DATA is True, 
+        # relying on hadoop-aws to pull necessary dependencies.
+        if USE_S3_FOR_DATA and jar_name == 'aws_sdk':
+            logger.info(f"Conditionally skipping {jar_name} ({jar_info.get('path', 'N/A')}) for S3/Glue setup. "
+                        f"Relying on hadoop-aws dependencies.")
+            continue # Skip adding this JAR to jar_paths and downloading it
+
         jar_path = jar_info['path']
         jar_paths.append(jar_path)
         if not os.path.exists(jar_path):
             jar_url = jar_info['url']
-            logger.info(f"Downloading {jar_name} JAR from {jar_url}")
+            logger.info(f"Downloading {jar_name} JAR from {jar_url} to {jar_path}")
             try:
                 os.makedirs(os.path.dirname(jar_path), exist_ok=True)
                 import requests
@@ -128,19 +154,36 @@ def init_spark(**context):
         else:
             logger.info(f"JAR file already exists: {jar_path}")
 
-    jars_path_str = ",".join(jar_paths)
-    os.environ['PYSPARK_SUBMIT_ARGS'] = f'--jars {jars_path_str} pyspark-shell'
+    if not jar_paths: # Handle case where all JARs might be skipped (e.g. if only aws_sdk was listed and skipped)
+        logger.warning("No JARs were added to PYSPARK_SUBMIT_ARGS. This might be an issue if JARs are required.")
+        # Decide if PYSPARK_SUBMIT_ARGS should be set at all or set to empty
+        # For now, let's ensure it's not set with an empty --jars flag if jar_paths is empty.
+        if 'PYSPARK_SUBMIT_ARGS' in os.environ:
+             del os.environ['PYSPARK_SUBMIT_ARGS'] # Clear it if it was set before
+    else:
+        jars_path_str = ",".join(jar_paths)
+        # Remove 'pyspark-shell' for programmatic session creation
+        os.environ['PYSPARK_SUBMIT_ARGS'] = f'--jars {jars_path_str}'
     logger.info(f"Set PYSPARK_SUBMIT_ARGS: {os.environ['PYSPARK_SUBMIT_ARGS']}")
 
-    # Base SparkSession builder
+    # Base SparkSession builder for local mode
     builder = (
         SparkSession.builder.appName("AnthemFileProcessing")
+        .master("local[*]")  # Explicitly set local master
+        .config("spark.driver.host", "localhost") # Use localhost for driver in local mode
+        .config("spark.driver.bindAddress", "localhost") # Bind to localhost
+        .config("spark.driver.extraJavaOptions", "-Djava.net.preferIPv4Stack=true") # Prefer IPv4 for driver
+        .config("spark.executor.extraJavaOptions", "-Djava.net.preferIPv4Stack=true") # Prefer IPv4 for executors
+        .config("spark.rpc.netty.dispatcher.numThreads", "2") # Explicitly set Netty dispatcher threads
+        .config("spark.network.io.preferDirectBufs", "false") # Use heap buffers for Netty
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
         .config("spark.sql.catalog.spark_catalog", "org.apache.iceberg.spark.SparkSessionCatalog") # Default Spark catalog
         .config("spark.sql.catalog.spark_catalog.type", "hive")
         .config("spark.sql.parquet.compression.codec", "zstd")
         .config("spark.driver.memory", "4g")
         .config("spark.executor.memory", "4g")
+        # Add a shuffle partitions config, good for local mode and can prevent some errors with small data
+        .config("spark.sql.shuffle.partitions", "4") 
     )
 
     # Determine warehouse location and configure catalog based on USE_S3_FOR_DATA
@@ -173,8 +216,20 @@ def init_spark(**context):
     # Set log level
     spark.sparkContext.setLogLevel("WARN")
 
-    # Log Spark version
+    # Log Spark configurations for diagnostics
     logger.info(f"Spark version: {spark.version}")
+    logger.info(f"Spark master: {spark.conf.get('spark.master')}")
+    logger.info(f"Spark driver host: {spark.conf.get('spark.driver.host')}")
+    logger.info(f"Spark driver bindAddress: {spark.conf.get('spark.driver.bindAddress')}")
+    logger.info(f"Spark driver extraJavaOptions: {spark.conf.get('spark.driver.extraJavaOptions')}")
+    logger.info(f"Spark executor extraJavaOptions: {spark.conf.get('spark.executor.extraJavaOptions')}")
+    logger.info(f"Spark rpc.netty.dispatcher.numThreads: {spark.conf.get('spark.rpc.netty.dispatcher.numThreads')}")
+    logger.info(f"Spark network.io.preferDirectBufs: {spark.conf.get('spark.network.io.preferDirectBufs')}")
+    try:
+        logger.info(f"Spark driver port: {spark.conf.get('spark.driver.port')}")
+        logger.info(f"Spark UI Web URL: {spark.sparkContext.uiWebUrl}")
+    except Exception as e:
+        logger.warning(f"Could not retrieve some Spark runtime configurations (e.g., port, UI URL): {e}")
 
     return spark
 
