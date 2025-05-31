@@ -35,7 +35,7 @@ from airflow.models import Variable
 # Feature flags for the cloud-agnostic approach
 # These can be toggled to enable/disable specific features during development and testing
 USE_S3_SENSOR = False      # False = Use EmptyOperator instead of S3 sensor (more portable)
-USE_S3_FOR_DATA = False    # False = Use local files instead of S3 (cloud-agnostic)
+USE_S3_FOR_DATA = True    # False = Use local files instead of S3 (cloud-agnostic)
 USE_SPARK_ICEBERG = True   # True = Use Iceberg for data lake (core technology)
 
 # Default arguments
