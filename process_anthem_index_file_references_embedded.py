@@ -404,7 +404,7 @@ def extract_file_references_task(setup_output=None): # Accepts output from setup
             logger.info(f"Using local file path: {config['index_file']}")
         
         # Initialize Spark with JAR files for Iceberg
-        spark = init_spark(**context)
+        spark = init_spark()
         
         # Create the Iceberg table if it doesn't exist - using standard Iceberg API
         logger.info(f"Creating Iceberg table {config['catalog_name']}.{config['file_refs_table']} if it doesn't exist")
