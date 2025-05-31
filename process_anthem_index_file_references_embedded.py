@@ -93,97 +93,89 @@ config = {
 
 # Task 2: Setup the environment and prepare for data processing
 def init_spark(**context):
-    """Initialize Spark session with Iceberg support exactly like the shell script.
-    This implementation uses a cloud-agnostic approach that works with any storage system.
+    """Initialize Spark session with Iceberg support.
+    Handles distinct configurations for S3/Glue and local Hadoop-style storage.
     """
     import logging
     import os
-    
+    from pyspark.sql import SparkSession
+
     logger = logging.getLogger('airflow.task')
-    logger.info(f"Initializing Spark with Iceberg support...")
-    logger.info(f"Warehouse location: {config['warehouse_location']}")
-    
-    # Create JAR directory if it doesn't exist
+    logger.info("Initializing Spark with Iceberg support...")
+
+    # JAR setup (download if needed)
     os.makedirs(config['jar_dir'], exist_ok=True)
-    
-    # Check if jars exist and download if needed
     jar_paths = []
     for jar_name, jar_info in config['jar_files'].items():
         jar_path = jar_info['path']
         jar_paths.append(jar_path)
-        
-        # Download JAR if it doesn't exist
         if not os.path.exists(jar_path):
             jar_url = jar_info['url']
             logger.info(f"Downloading {jar_name} JAR from {jar_url}")
             try:
-                # Create parent directory if it doesn't exist
                 os.makedirs(os.path.dirname(jar_path), exist_ok=True)
-                
-                # Download the JAR file
                 import requests
                 response = requests.get(jar_url, stream=True)
                 response.raise_for_status()
-                
                 with open(jar_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                
+                        if chunk: f.write(chunk)
                 logger.info(f"Successfully downloaded {jar_path}")
             except Exception as e:
                 error_msg = f"Failed to download {jar_name} JAR: {str(e)}"
                 logger.error(error_msg)
-                with open(config['log_file'], 'a') as f:
-                    f.write(f"ERROR: {error_msg}\n")
+                # Consider raising an exception here or ensuring the DAG fails if critical JARs are missing
         else:
             logger.info(f"JAR file already exists: {jar_path}")
-    
-    # Make sure environment variables are set just like in the shell script
-    jars_path = ",".join(jar_paths)
-    os.environ['PYSPARK_SUBMIT_ARGS'] = f'--jars {jars_path} pyspark-shell'
+
+    jars_path_str = ",".join(jar_paths)
+    os.environ['PYSPARK_SUBMIT_ARGS'] = f'--jars {jars_path_str} pyspark-shell'
     logger.info(f"Set PYSPARK_SUBMIT_ARGS: {os.environ['PYSPARK_SUBMIT_ARGS']}")
-    
-    # If we're not using S3, update the warehouse location to a local path
-    warehouse_location = config['warehouse_location']
-    if not USE_S3_FOR_DATA and warehouse_location.startswith('s3'):
-        warehouse_location = f"file://{config['output_dir']}/warehouse"
-        logger.info(f"Using local warehouse location: {warehouse_location}")
-    else:
-        logger.info(f"Using S3 warehouse location: {warehouse_location}")
-    
-    # Create the Spark session with cloud-agnostic configuration
-    builder = (SparkSession.builder
-             .appName("Anthem File References Extractor")
-             .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
-             .config(f"spark.sql.catalog.{config['catalog_name']}", "org.apache.iceberg.spark.SparkCatalog")
-             .config(f"spark.sql.catalog.{config['catalog_name']}.type", "hadoop")
-             .config(f"spark.sql.catalog.{config['catalog_name']}.warehouse", warehouse_location)
-             .config("spark.sql.catalog.spark_catalog", "org.apache.iceberg.spark.SparkSessionCatalog")
-             .config("spark.sql.catalog.spark_catalog.type", "hive")
-             .config("spark.sql.parquet.compression.codec", "zstd")
-             .config("spark.driver.memory", "4g")
-             .config("spark.executor.memory", "4g")
+
+    # Base SparkSession builder
+    builder = (
+        SparkSession.builder.appName("AnthemFileProcessing")
+        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+        .config("spark.sql.catalog.spark_catalog", "org.apache.iceberg.spark.SparkSessionCatalog") # Default Spark catalog
+        .config("spark.sql.catalog.spark_catalog.type", "hive")
+        .config("spark.sql.parquet.compression.codec", "zstd")
+        .config("spark.driver.memory", "4g")
+        .config("spark.executor.memory", "4g")
     )
-    
-    # Add S3-specific configs only if using S3
+
+    # Determine warehouse location and configure catalog based on USE_S3_FOR_DATA
     if USE_S3_FOR_DATA:
-        builder = (builder
+        warehouse_location = config['warehouse_location'] # Should be an S3 path
+        logger.info(f"Using S3 warehouse location: {warehouse_location} for catalog {config['catalog_name']}")
+        builder = (
+            builder
+            .config(f"spark.sql.catalog.{config['catalog_name']}", "org.apache.iceberg.spark.SparkCatalog") # Main catalog for Iceberg
             .config(f"spark.sql.catalog.{config['catalog_name']}.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+            .config(f"spark.sql.catalog.{config['catalog_name']}.warehouse", warehouse_location)
             .config(f"spark.sql.catalog.{config['catalog_name']}.default-namespace", "default")
             .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
             .config("spark.hadoop.fs.s3a.aws.credentials.provider", "com.amazonaws.auth.DefaultAWSCredentialsProviderChain")
-            .config("spark.hadoop.fs.s3a.path.style.access", "true"))
-    
+            .config("spark.hadoop.fs.s3a.path.style.access", "true")
+        )
+    else:
+        warehouse_location = f"file://{config['output_dir']}/warehouse"
+        logger.info(f"Using local warehouse location: {warehouse_location} for catalog {config['catalog_name']}")
+        builder = (
+            builder
+            .config(f"spark.sql.catalog.{config['catalog_name']}", "org.apache.iceberg.spark.SparkCatalog") # Main catalog for Iceberg
+            .config(f"spark.sql.catalog.{config['catalog_name']}.type", "hadoop")
+            .config(f"spark.sql.catalog.{config['catalog_name']}.warehouse", warehouse_location)
+        )
+
     # Create the Spark session
     spark = builder.getOrCreate()
-    
+
     # Set log level
     spark.sparkContext.setLogLevel("WARN")
-    
+
     # Log Spark version
     logger.info(f"Spark version: {spark.version}")
-    
+
     return spark
 
 
