@@ -126,9 +126,9 @@ def init_spark(**context):
     jar_paths = []
     logger.info("Processing JAR dependencies...")
     for jar_name, jar_info in config['jar_files'].items():
-        # Conditionally skip aws_sdk bundle if USE_S3_FOR_DATA is True, 
+        # Conditionally skip aws-java-sdk bundle if USE_S3_FOR_DATA is True, 
         # relying on hadoop-aws to pull necessary dependencies.
-        if USE_S3_FOR_DATA and jar_name == 'aws_sdk':
+        if USE_S3_FOR_DATA and jar_name == 'aws-java-sdk':
             logger.info(f"Conditionally skipping {jar_name} ({jar_info.get('path', 'N/A')}) for S3/Glue setup. "
                         f"Relying on hadoop-aws dependencies.")
             continue # Skip adding this JAR to jar_paths and downloading it
