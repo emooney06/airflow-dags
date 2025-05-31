@@ -25,8 +25,9 @@ from pyspark.sql import SparkSession
 from pyspark.sql.types import StructType, StructField, StringType, DateType, TimestampType
 from pyspark.sql.functions import col, lit, to_date, regexp_extract, expr
 
-from airflow import DAG
-from airflow.operators.python import PythonOperator
+# from airflow import DAG # Replaced by TaskFlow
+# from airflow.operators.python import PythonOperator # Replaced by TaskFlow
+from airflow.decorators import dag, task # Added for TaskFlow API
 from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
 from airflow.operators.empty import EmptyOperator
 from airflow.models import Variable
@@ -48,16 +49,7 @@ default_args = {
     'execution_timeout': timedelta(hours=24),  # Longer timeout for large file processing
 }
 
-# Define DAG
-dag = DAG(
-    'process_anthem_index_file_references',
-    default_args=default_args,
-    description='Process Anthem price transparency data to Iceberg tables',
-    schedule='@monthly',  # Monthly execution - adjust as needed
-    start_date=datetime(2025, 5, 1),
-    catchup=False,
-    tags=['price-transparency', 'anthem', 'iceberg'],
-)
+# DAG definition will be done using @dag decorator later in the file
 
 # Configuration - Exact parameters from shell script command
 config = {
@@ -85,8 +77,8 @@ config = {
     'jar_dir': os.path.expanduser('~/jars'),
     'jar_files': {
         'iceberg-spark': {
-            'path': os.path.join(os.path.expanduser('~/jars'), 'iceberg-spark-runtime-3.5_2.12-1.4.2.jar'),
-            'url': 'https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.4.2/iceberg-spark-runtime-3.5_2.12-1.4.2.jar'
+            'path': os.path.join(os.path.expanduser('~/jars'), 'iceberg-spark-runtime-3.3_2.12-1.4.2.jar'), # Switched to Spark 3.3 version for Java 11 compatibility
+            'url': 'https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.3_2.12/1.4.2/iceberg-spark-runtime-3.3_2.12-1.4.2.jar' # Updated URL
         },
         'hadoop-aws': {
             'path': os.path.join(os.path.expanduser('~/jars'), 'hadoop-aws-3.3.4.jar'),
@@ -238,7 +230,8 @@ def create_file_refs_table(spark):
     return True
 
 
-def setup_environment(**context):
+@task
+def setup_environment_task():
     """Create working directory and prepare the environment.
     Download required JARs for Spark and Iceberg exactly like the shell script.
     """
@@ -340,7 +333,8 @@ def setup_environment(**context):
     return True
 
 # Task 3: Extract file references and save to output file
-def extract_file_references(**context):
+@task
+def extract_file_references_task(setup_output=None): # Accepts output from setup_task if needed
     """
     Extract file references from the Anthem index file and store in Iceberg tables.
     This function implements a cloud-agnostic approach using standard components rather
@@ -572,26 +566,31 @@ def extract_file_references(**context):
             f.write(f"- Allowed Amount: {allowed_amount_count}\n")
             f.write(f"- Other: {other_count}\n")
         logger.info(f"Detailed summary written to {config['summary_file']}")
-        context['ti'].xcom_push(key='total_file_refs_identified', value=total_references_identified)
-        context['ti'].xcom_push(key='total_records_written_iceberg', value=total_records_written_to_iceberg)
-        context['ti'].xcom_push(key='in_network_count', value=in_network_count)
-        context['ti'].xcom_push(key='allowed_amount_count', value=allowed_amount_count)
-        context['ti'].xcom_push(key='other_count', value=other_count)
-        context['ti'].xcom_push(key='sample_urls', value=sample_urls_for_output[:15]) # Limit XCom size for safety
+
+        # Prepare data for XCom (TaskFlow returns values)
+        xcom_data = {
+            'total_file_refs_identified': total_references_identified,
+            'total_records_written_iceberg': total_records_written_to_iceberg,
+            'in_network_count': in_network_count,
+            'allowed_amount_count': allowed_amount_count,
+            'other_count': other_count,
+            'sample_urls': sample_urls_for_output[:15]  # Limit XCom size for safety
+        }
+        logger.info(f"Task will return XCom data: {list(xcom_data.keys())}") # Log keys
 
         logger.info("Stopping Spark session...")
         spark.stop()
         logger.info("Spark session stopped successfully.")
         
-        end_time = time.time() # start_time is defined at the beginning of extract_file_references
-        elapsed_seconds = end_time - start_time
+        end_time = time.time() # Define end_time AFTER Spark stop
+        elapsed_seconds = end_time - start_time # start_time is defined at the beginning of the function
         hours = int(elapsed_seconds // 3600)
         minutes = int((elapsed_seconds % 3600) // 60)
         seconds = int(elapsed_seconds % 60)
         logger.info(f"✅ extract_file_references task complete! Took {hours}h {minutes}m {seconds}s ({elapsed_seconds:.2f}s)")
         logger.info(f"Identified {total_references_identified} references. Attempted to write {total_records_written_to_iceberg} records to Iceberg.")
         
-        return total_records_written_to_iceberg # Return count of records successfully processed into batches for Iceberg
+        return xcom_data # Return dictionary of results for XCom
 
     except Exception as e:
         logger.error(f"❌ Error during file reference extraction's main try block: {str(e)}")
@@ -660,18 +659,21 @@ def test_s3_access():
         traceback.print_exc(file=open(config['log_file'], "a"))
         return False
 
-# Create the simplified task instances
-setup_env = PythonOperator(
-    task_id='setup_environment',
-    python_callable=setup_environment,
-    dag=dag
-)
+# Task instances and dependencies are defined using the @dag decorated function below
 
-extract_file_refs = PythonOperator(
-    task_id='extract_file_references',
-    python_callable=extract_file_references,
-    dag=dag
+@dag(
+    dag_id='process_anthem_index_file_references',
+    default_args=default_args,
+    description='Process Anthem price transparency data to Iceberg tables (TaskFlow API)',
+    schedule_interval='@monthly',
+    start_date=datetime(2025, 5, 1),
+    catchup=False,
+    tags=['price-transparency', 'anthem', 'iceberg', 'taskflow'],
 )
+def anthem_processing_tf_dag():
+    """Main DAG definition using TaskFlow API."""
+    setup_task_output = setup_environment_task()
+    extract_file_references_task(setup_task_output) # Pass output if setup_environment_task returned something, or just for dependency
 
-# Define simplified task dependencies - just setup and extract
-setup_env >> extract_file_refs
+# Instantiate the DAG
+anthem_dag_instance = anthem_processing_tf_dag()
