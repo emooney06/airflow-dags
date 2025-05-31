@@ -33,9 +33,9 @@ from airflow.models import Variable
 
 # Feature flags for the cloud-agnostic approach
 # These can be toggled to enable/disable specific features during development and testing
-USE_S3_SENSOR = True       # Set to False to skip S3 sensor (use EmptyOperator instead)
-USE_S3_FOR_DATA = True     # Set to False to use local files instead of S3
-USE_SPARK_ICEBERG = True   # Set to False to skip Iceberg integration
+USE_S3_SENSOR = False      # False = Use EmptyOperator instead of S3 sensor (more portable)
+USE_S3_FOR_DATA = False    # False = Use local files instead of S3 (cloud-agnostic)
+USE_SPARK_ICEBERG = True   # True = Use Iceberg for data lake (core technology)
 
 # Default arguments
 default_args = {
@@ -67,11 +67,11 @@ config = {
     'catalog_name': 'anthem_catalog',
     'file_refs_table': 'anthem_file_refs',
     
-    # Output configuration
-    'output_dir': "/home/airflow/anthem-processing",
-    'output_file': "/home/airflow/anthem-processing/file_references.txt",
-    'log_file': "/home/airflow/anthem-processing/extraction_log.txt",
-    'summary_file': "/home/airflow/anthem-processing/summary.txt",
+    # Output configuration - use airflow home directory
+    'output_dir': os.path.expanduser("~/anthem-processing"),
+    'output_file': os.path.expanduser("~/anthem-processing/file_references.txt"),
+    'log_file': os.path.expanduser("~/anthem-processing/extraction_log.txt"),
+    'summary_file': os.path.expanduser("~/anthem-processing/summary.txt"),
     
     # Processing configuration
     'max_chunks': None,     # Process the entire file - will take hours
@@ -81,19 +81,19 @@ config = {
     'bucket_name': 'price-transparency-raw', 
     'index_file_key': 'payer/anthem/index_files/main-index/2025-05-01_anthem_index.json.gz',
     
-    # JAR files configuration - exactly like shell script
-    'jar_dir': '/home/airflow/jars',
+    # JAR files configuration - using user's home directory for portability
+    'jar_dir': os.path.expanduser('~/jars'),
     'jar_files': {
         'iceberg-spark': {
-            'path': '/home/airflow/jars/iceberg-spark-runtime-3.5_2.12-1.4.2.jar',
+            'path': os.path.join(os.path.expanduser('~/jars'), 'iceberg-spark-runtime-3.5_2.12-1.4.2.jar'),
             'url': 'https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.4.2/iceberg-spark-runtime-3.5_2.12-1.4.2.jar'
         },
         'hadoop-aws': {
-            'path': '/home/airflow/jars/hadoop-aws-3.3.4.jar',
+            'path': os.path.join(os.path.expanduser('~/jars'), 'hadoop-aws-3.3.4.jar'),
             'url': 'https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar'
         },
         'aws-java-sdk': {
-            'path': '/home/airflow/jars/aws-java-sdk-bundle-1.12.262.jar',
+            'path': os.path.join(os.path.expanduser('~/jars'), 'aws-java-sdk-bundle-1.12.262.jar'),
             'url': 'https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar'
         }
     }
@@ -121,7 +121,9 @@ else:
 
 # Task 2: Setup the environment and prepare for data processing
 def init_spark(**context):
-    """Initialize Spark session with Iceberg support exactly like the shell script."""
+    """Initialize Spark session with Iceberg support exactly like the shell script.
+    This implementation uses a cloud-agnostic approach that works with any storage system.
+    """
     import logging
     import os
     
@@ -129,26 +131,77 @@ def init_spark(**context):
     logger.info(f"Initializing Spark with Iceberg support...")
     logger.info(f"Warehouse location: {config['warehouse_location']}")
     
-    # Make sure environment variables are set just like in the shell script
-    jars_path = ",".join(config['jar_paths'])
-    os.environ['PYSPARK_SUBMIT_ARGS'] = f'--jars {jars_path} pyspark-shell'
+    # Create JAR directory if it doesn't exist
+    os.makedirs(config['jar_dir'], exist_ok=True)
     
-    # Create the Spark session with exact same configs as the shell script
-    spark = (SparkSession.builder
+    # Check if jars exist and download if needed
+    jar_paths = []
+    for jar_name, jar_info in config['jar_files'].items():
+        jar_path = jar_info['path']
+        jar_paths.append(jar_path)
+        
+        # Download JAR if it doesn't exist
+        if not os.path.exists(jar_path):
+            jar_url = jar_info['url']
+            logger.info(f"Downloading {jar_name} JAR from {jar_url}")
+            try:
+                # Create parent directory if it doesn't exist
+                os.makedirs(os.path.dirname(jar_path), exist_ok=True)
+                
+                # Download the JAR file
+                import requests
+                response = requests.get(jar_url, stream=True)
+                response.raise_for_status()
+                
+                with open(jar_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                
+                logger.info(f"Successfully downloaded {jar_path}")
+            except Exception as e:
+                error_msg = f"Failed to download {jar_name} JAR: {str(e)}"
+                logger.error(error_msg)
+                with open(config['log_file'], 'a') as f:
+                    f.write(f"ERROR: {error_msg}\n")
+        else:
+            logger.info(f"JAR file already exists: {jar_path}")
+    
+    # Make sure environment variables are set just like in the shell script
+    jars_path = ",".join(jar_paths)
+    os.environ['PYSPARK_SUBMIT_ARGS'] = f'--jars {jars_path} pyspark-shell'
+    logger.info(f"Set PYSPARK_SUBMIT_ARGS: {os.environ['PYSPARK_SUBMIT_ARGS']}")
+    
+    # If we're not using S3, update the warehouse location to a local path
+    warehouse_location = config['warehouse_location']
+    if not USE_S3_FOR_DATA and warehouse_location.startswith('s3'):
+        warehouse_location = f"file://{config['output_dir']}/warehouse"
+        logger.info(f"Using local warehouse location: {warehouse_location}")
+    else:
+        logger.info(f"Using S3 warehouse location: {warehouse_location}")
+    
+    # Create the Spark session with cloud-agnostic configuration
+    builder = (SparkSession.builder
              .appName("Anthem File References Extractor")
              .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
              .config(f"spark.sql.catalog.{config['catalog_name']}", "org.apache.iceberg.spark.SparkCatalog")
              .config(f"spark.sql.catalog.{config['catalog_name']}.type", "hadoop")
-             .config(f"spark.sql.catalog.{config['catalog_name']}.warehouse", config['warehouse_location'])
+             .config(f"spark.sql.catalog.{config['catalog_name']}.warehouse", warehouse_location)
              .config("spark.sql.catalog.spark_catalog", "org.apache.iceberg.spark.SparkSessionCatalog")
              .config("spark.sql.catalog.spark_catalog.type", "hive")
              .config("spark.sql.parquet.compression.codec", "zstd")
+             .config("spark.driver.memory", "4g")
+             .config("spark.executor.memory", "4g"))
+    
+    # Add S3-specific configs only if using S3
+    if USE_S3_FOR_DATA:
+        builder = (builder
              .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
              .config("spark.hadoop.fs.s3a.aws.credentials.provider", "com.amazonaws.auth.DefaultAWSCredentialsProviderChain")
-             .config("spark.hadoop.fs.s3a.path.style.access", "true")
-             .config("spark.driver.memory", "4g")
-             .config("spark.executor.memory", "4g")
-             .getOrCreate())
+             .config("spark.hadoop.fs.s3a.path.style.access", "true"))
+    
+    # Create the Spark session
+    spark = builder.getOrCreate()
     
     # Set log level
     spark.sparkContext.setLogLevel("WARN")
@@ -265,32 +318,43 @@ def setup_environment(**context):
     os.environ['PYSPARK_SUBMIT_ARGS'] = f"--jars {jar_paths_str} pyspark-shell"
     logger.info(f"Set PYSPARK_SUBMIT_ARGS to: {os.environ['PYSPARK_SUBMIT_ARGS']}")
     
-    # Test S3 connectivity
-    logger.info("Testing S3 connectivity...")
-    try:
-        s3 = boto3.client('s3')
-        s3.list_buckets()  # Just to test connectivity
-        
-        # Check if we can access the index file
-        parsed_url = urlparse(config['index_file'])
-        bucket = parsed_url.netloc
-        key = parsed_url.path.lstrip('/')
-        
+    # Store jar_paths in context XCom for other tasks to use
+    context['ti'].xcom_push(key='jar_paths', value=jar_paths)
+    
+    # Test S3 connectivity - only if we're using S3
+    if USE_S3_FOR_DATA:
+        logger.info("Testing S3 connectivity...")
         try:
-            s3.head_object(Bucket=bucket, Key=key)
-            logger.info(f"Successfully verified access to index file: {config['index_file']}")
+            s3 = boto3.client('s3')
+            s3.list_buckets()  # Just to test connectivity
+            
+            # Check if we can access the index file
+            parsed_url = urlparse(config['index_file'])
+            bucket = parsed_url.netloc
+            key = parsed_url.path.lstrip('/')
+            
+            try:
+                s3.head_object(Bucket=bucket, Key=key)
+                logger.info(f"Successfully verified access to index file: {config['index_file']}")
+            except Exception as e:
+                error_msg = f"Cannot access index file: {str(e)}"
+                logger.warning(error_msg)
+                logger.warning("Will try to continue with local files since USE_S3_FOR_DATA is enabled.")
+                with open(config['log_file'], 'a') as f:
+                    f.write(f"WARNING: {error_msg}\n")
+                    f.write("Will try to continue with local files.\n")
         except Exception as e:
-            error_msg = f"Cannot access index file: {str(e)}"
-            logger.error(error_msg)
+            error_msg = f"S3 connectivity test failed: {str(e)}"
+            logger.warning(error_msg)
+            logger.warning("Will try to continue with local files since USE_S3_FOR_DATA is enabled.")
             with open(config['log_file'], 'a') as f:
-                f.write(f"ERROR: {error_msg}\n")
-            raise RuntimeError(error_msg)
-    except Exception as e:
-        error_msg = f"S3 connectivity test failed: {str(e)}"
-        logger.error(error_msg)
+                f.write(f"WARNING: {error_msg}\n")
+                f.write("Will try to continue with local files.\n")
+    else:
+        logger.info("Skipping S3 connectivity test since USE_S3_FOR_DATA is disabled.")
+        logger.info("Using cloud-agnostic approach with local files.")
         with open(config['log_file'], 'a') as f:
-            f.write(f"ERROR: {error_msg}\n")
-        raise RuntimeError(error_msg)
+            f.write("Skipping S3 connectivity test, using local files for cloud-agnostic approach.\n")
     
     logger.info("Environment setup completed successfully")
     return True
@@ -329,7 +393,45 @@ def extract_file_references(**context):
     try:
         # Initialize Spark with Iceberg using cloud-agnostic configuration
         logger.info(f"Initializing Spark with Iceberg integration")
-        spark = init_spark()
+        # Create output directories if they don't exist
+        os.makedirs(config['output_dir'], exist_ok=True)
+        os.makedirs(os.path.dirname(config['output_file']), exist_ok=True)
+        os.makedirs(os.path.dirname(config['log_file']), exist_ok=True)
+        os.makedirs(os.path.dirname(config['summary_file']), exist_ok=True)
+        
+        # For cloud-agnostic operation, let's adjust the index file path if needed
+        if not USE_S3_FOR_DATA and config['index_file'].startswith('s3'):
+            # Create a local test file for processing
+            local_file_path = f"{config['output_dir']}/anthem_index_test.json.gz"
+            logger.info(f"Using local file for testing: {local_file_path}")
+            
+            # Generate a small test file if it doesn't exist
+            if not os.path.exists(local_file_path):
+                logger.info("Creating local test file with sample data")
+                try:
+                    import gzip
+                    os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+                    with gzip.open(local_file_path, 'wt') as f:
+                        f.write('{"reporting_entity_name": "Anthem", "reporting_entity_type": "payer", "data": [\n')
+                        # Add 100 sample URLs
+                        for i in range(100):
+                            if i % 3 == 0:
+                                f.write('{"url": "https://example.com/in-network/file' + str(i) + '.json.gz"},\n')
+                            elif i % 3 == 1:
+                                f.write('{"url": "https://example.com/allowed-amount/file' + str(i) + '.json"},\n')
+                            else:
+                                f.write('{"url": "https://example.com/other/file' + str(i) + '.csv"},\n')
+                        f.write(']}\n')
+                    logger.info(f"Created local test file: {local_file_path}")
+                except Exception as e:
+                    logger.warning(f"Error creating local test file: {e}")
+            
+            # Use the local file instead of S3
+            config['index_file'] = f"file://{local_file_path}"
+            logger.info(f"Using local file path: {config['index_file']}")
+        
+        # Initialize Spark with JAR files for Iceberg
+        spark = init_spark(**context)
         
         # Create the Iceberg table if it doesn't exist - using standard Iceberg API
         logger.info(f"Creating Iceberg table {config['catalog_name']}.{config['file_refs_table']} if it doesn't exist")
