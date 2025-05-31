@@ -191,6 +191,7 @@ def create_file_refs_table(spark):
     import logging
     logger = logging.getLogger('airflow.task')
     
+    logger.info(f"Inside create_file_refs_table. Configured catalog_name: '{config.get('catalog_name')}', file_refs_table: '{config.get('file_refs_table')}'")
     logger.info(f"Creating Iceberg table {config['catalog_name']}.{config['file_refs_table']} if it doesn't exist...")
     
     # Create table with exact same schema as the shell script
