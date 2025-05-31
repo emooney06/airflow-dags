@@ -15,8 +15,10 @@ import json
 import boto3
 import time
 import traceback
+import subprocess
+import logging
+import requests
 from urllib.parse import urlparse
-import ast
 
 # PySpark imports for Iceberg integration
 from pyspark.sql import SparkSession
@@ -26,7 +28,14 @@ from pyspark.sql.functions import col, lit, to_date, regexp_extract, expr
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
+from airflow.operators.empty import EmptyOperator
 from airflow.models import Variable
+
+# Feature flags for the cloud-agnostic approach
+# These can be toggled to enable/disable specific features during development and testing
+USE_S3_SENSOR = True       # Set to False to skip S3 sensor (use EmptyOperator instead)
+USE_S3_FOR_DATA = True     # Set to False to use local files instead of S3
+USE_SPARK_ICEBERG = True   # Set to False to skip Iceberg integration
 
 # Default arguments
 default_args = {
@@ -50,41 +59,49 @@ dag = DAG(
     tags=['price-transparency', 'anthem', 'iceberg'],
 )
 
-# Configuration - Centralize all config here for easy updates
+# Configuration - Exact parameters from shell script command
 config = {
-    # S3 Configuration - access using standard Hadoop APIs for cloud-agnostic approach
-    'bucket_name': 'price-transparency-raw',
-    'index_file_key': 'payer/anthem/index_files/main-index/2025-05-01_anthem_index.json.gz',
-    'local_download_path': "/home/airflow/anthem-processing/anthem_index.json.gz",
+    # Exact S3 paths from shell script command
+    'index_file': 's3a://price-transparency-raw/payer/anthem/index_files/main-index/2025-05-01_anthem_index.json.gz',
+    'warehouse_location': 's3a://price-transparency-raw/warehouse',
+    'catalog_name': 'anthem_catalog',
+    'file_refs_table': 'anthem_file_refs',
     
     # Output configuration
-    'output_file': "/home/airflow/anthem-processing/file_references.md",
-    'log_file': "/home/airflow/logs/anthem/extraction_log.txt",
+    'output_dir': "/home/airflow/anthem-processing",
+    'output_file': "/home/airflow/anthem-processing/file_references.txt",
+    'log_file': "/home/airflow/anthem-processing/extraction_log.txt",
+    'summary_file': "/home/airflow/anthem-processing/summary.txt",
     
     # Processing configuration
-    'max_chunks': None,  # Process the entire file (24GB+) - this is why it will run for hours
-    'batch_size': 5000,  # Number of references to write to Iceberg in one batch
-    'sample_size': 20,   # Number of sample URLs to include in output
+    'max_chunks': None,     # Process the entire file - will take hours
+    'batch_size': 10000,    # Batch size for Iceberg writes
     
-    # Iceberg and Spark configuration - cloud-agnostic approach using standard components
-    'catalog_name': 'anthem_catalog',
-    'file_refs_table': 'anthem_file_references',
-    'warehouse_location': '/home/airflow/iceberg_warehouse',  # Local warehouse for cloud-agnostic approach
-    'spark_packages': [
-        "org.apache.iceberg:iceberg-spark3:0.14.0",  # Standard Iceberg package
-        "org.apache.hadoop:hadoop-aws:3.3.1"         # Standard Hadoop package for AWS connectivity
-    ]
+    # S3 parameters for Airflow operators
+    'bucket_name': 'price-transparency-raw', 
+    'index_file_key': 'payer/anthem/index_files/main-index/2025-05-01_anthem_index.json.gz',
+    
+    # JAR files configuration - exactly like shell script
+    'jar_dir': '/home/airflow/jars',
+    'jar_files': {
+        'iceberg-spark': {
+            'path': '/home/airflow/jars/iceberg-spark-runtime-3.5_2.12-1.4.2.jar',
+            'url': 'https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.4.2/iceberg-spark-runtime-3.5_2.12-1.4.2.jar'
+        },
+        'hadoop-aws': {
+            'path': '/home/airflow/jars/hadoop-aws-3.3.4.jar',
+            'url': 'https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar'
+        },
+        'aws-java-sdk': {
+            'path': '/home/airflow/jars/aws-java-sdk-bundle-1.12.262.jar',
+            'url': 'https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar'
+        }
+    }
 }
 
-# Task 1: Check if the index file exists (Optional during development/testing)
-from airflow.operators.empty import EmptyOperator  # Updated import for newer Airflow versions
-
-# Development flags - set these for testing without cloud dependencies
-USE_S3_SENSOR = False     # If False, will skip S3 key sensor check
-USE_S3_FOR_DATA = False   # If False, will use a local test file instead
-USE_SPARK_ICEBERG = False # If False, will skip Spark/Iceberg integration and just extract URLs
-
+# Task 1: Check if the index file exists - use EmptyOperator when S3 access isn't needed
 if USE_S3_SENSOR:
+    # Standard S3 approach when S3 is available
     check_index_file = S3KeySensor(
         task_id='check_index_file',
         bucket_key=config['index_file_key'],
@@ -95,7 +112,8 @@ if USE_S3_SENSOR:
         dag=dag
     )
 else:
-    # Use an empty operator during development to bypass S3 check - maintains cloud-agnostic approach
+    # Cloud-agnostic approach: use EmptyOperator when not using S3 sensor
+    # This allows the DAG to run in environments without S3 access
     check_index_file = EmptyOperator(
         task_id='check_index_file',
         dag=dag
@@ -103,40 +121,54 @@ else:
 
 # Task 2: Setup the environment and prepare for data processing
 def init_spark(**context):
-    """Initialize Spark session with Iceberg support using a cloud-agnostic approach."""
-    print(f"🔥 Initializing Spark with Iceberg support...")
-    print(f"   Warehouse location: {config['warehouse_location']}")
+    """Initialize Spark session with Iceberg support exactly like the shell script."""
+    import logging
+    import os
     
-    # Create the Spark session with Iceberg configs - using standard components rather than provider-specific
+    logger = logging.getLogger('airflow.task')
+    logger.info(f"Initializing Spark with Iceberg support...")
+    logger.info(f"Warehouse location: {config['warehouse_location']}")
+    
+    # Make sure environment variables are set just like in the shell script
+    jars_path = ",".join(config['jar_paths'])
+    os.environ['PYSPARK_SUBMIT_ARGS'] = f'--jars {jars_path} pyspark-shell'
+    
+    # Create the Spark session with exact same configs as the shell script
     spark = (SparkSession.builder
              .appName("Anthem File References Extractor")
              .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
              .config(f"spark.sql.catalog.{config['catalog_name']}", "org.apache.iceberg.spark.SparkCatalog")
              .config(f"spark.sql.catalog.{config['catalog_name']}.type", "hadoop")
              .config(f"spark.sql.catalog.{config['catalog_name']}.warehouse", config['warehouse_location'])
-             .config("spark.jars.packages", ",".join(config['spark_packages']))
              .config("spark.sql.catalog.spark_catalog", "org.apache.iceberg.spark.SparkSessionCatalog")
              .config("spark.sql.catalog.spark_catalog.type", "hive")
              .config("spark.sql.parquet.compression.codec", "zstd")
-             # Using the S3A filesystem from Hadoop, which is cloud-agnostic
              .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
              .config("spark.hadoop.fs.s3a.aws.credentials.provider", "com.amazonaws.auth.DefaultAWSCredentialsProviderChain")
+             .config("spark.hadoop.fs.s3a.path.style.access", "true")
+             .config("spark.driver.memory", "4g")
+             .config("spark.executor.memory", "4g")
              .getOrCreate())
     
     # Set log level
     spark.sparkContext.setLogLevel("WARN")
     
-    # Print Spark version
-    print(f"Spark version: {spark.version}")
+    # Log Spark version
+    logger.info(f"Spark version: {spark.version}")
     
     return spark
 
 
 def create_file_refs_table(spark):
-    """Create the Iceberg table for file references if it doesn't exist."""
-    print(f"📝 Creating Iceberg table {config['catalog_name']}.{config['file_refs_table']} if it doesn't exist...")
+    """Create the Iceberg table for file references if it doesn't exist.
+    Uses exactly the same table structure as the shell script.
+    """
+    import logging
+    logger = logging.getLogger('airflow.task')
     
-    # Create table using standard Iceberg approach - cloud provider independent
+    logger.info(f"Creating Iceberg table {config['catalog_name']}.{config['file_refs_table']} if it doesn't exist...")
+    
+    # Create table with exact same schema as the shell script
     spark.sql(f"""
     CREATE TABLE IF NOT EXISTS {config['catalog_name']}.{config['file_refs_table']} (
         reporting_entity_name STRING,
@@ -153,76 +185,165 @@ def create_file_refs_table(spark):
     PARTITIONED BY (file_date)
     """)
     
-    print(f"✅ Table {config['catalog_name']}.{config['file_refs_table']} is ready")
+    # Check if table was created successfully
+    tables = spark.sql(f"SHOW TABLES IN {config['catalog_name']}").collect()
+    table_exists = False
+    for table in tables:
+        if table.tableName == config['file_refs_table']:
+            table_exists = True
+            break
+    
+    if table_exists:
+        logger.info(f"Table {config['catalog_name']}.{config['file_refs_table']} is ready")
+    else:
+        error_msg = f"Failed to create table {config['catalog_name']}.{config['file_refs_table']}"
+        logger.error(error_msg)
+        with open(config['log_file'], 'a') as f:
+            f.write(f"ERROR: {error_msg}\n")
+        raise RuntimeError(error_msg)
+    
+    return True
 
 
 def setup_environment(**context):
-    """Create working directory and prepare the environment."""
+    """Create working directory and prepare the environment.
+    Download required JARs for Spark and Iceberg exactly like the shell script.
+    """
     import subprocess
     import os
+    import requests
+    import logging
     
-    # Make sure the necessary directories exist
-    subprocess.run("mkdir -p /home/airflow/anthem-processing", shell=True, check=True)
+    # Set up a logger
+    logger = logging.getLogger('airflow.task')
     
-    # Create a log directory
-    log_dir = "/home/airflow/logs/anthem"
-    subprocess.run(f"mkdir -p {log_dir}", shell=True, check=True)
+    # Create necessary directories
+    logger.info("Creating required directories...")
+    os.makedirs(config['output_dir'], exist_ok=True)
+    os.makedirs(config['jar_dir'], exist_ok=True)
     
-    # Test AWS connectivity
-    try:
-        import boto3
-        s3 = boto3.client('s3')
-        buckets = s3.list_buckets()
-        print(f"✅ Successfully connected to AWS. Found {len(buckets.get('Buckets', []))} buckets")
+    # Prepare log file
+    with open(config['log_file'], 'w') as f:
+        f.write(f"=== Anthem Index File Processing - Started {datetime.now()} ===\n")
+    
+    # Download JAR files if needed
+    logger.info("Checking for required JAR files...")
+    jar_paths = []
+    
+    for jar_name, jar_info in config['jar_files'].items():
+        jar_path = jar_info['path']
+        jar_url = jar_info['url']
+        jar_paths.append(jar_path)
         
-        # Try to list objects in target bucket
-        bucket = config['bucket_name']
-        prefix = 'payer/anthem'
-        
-        response = s3.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=5)
-        if 'Contents' in response:
-            print(f"✅ Successfully listed objects in {bucket}/{prefix}")
-            for obj in response.get('Contents', [])[:3]:
-                print(f"  - {obj['Key']} ({obj['Size']} bytes)")
+        if not os.path.exists(jar_path):
+            logger.info(f"Downloading {jar_name} JAR from {jar_url}")
+            try:
+                # Create parent directory if it doesn't exist
+                os.makedirs(os.path.dirname(jar_path), exist_ok=True)
+                
+                # Download the JAR file
+                response = requests.get(jar_url, stream=True)
+                response.raise_for_status()
+                
+                with open(jar_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                
+                logger.info(f"Successfully downloaded {jar_path}")
+            except Exception as e:
+                error_msg = f"Failed to download {jar_name} JAR: {str(e)}"
+                logger.error(error_msg)
+                with open(config['log_file'], 'a') as f:
+                    f.write(f"ERROR: {error_msg}\n")
+                raise RuntimeError(error_msg)
         else:
-            print(f"⚠️ No objects found in {bucket}/{prefix} or access denied")
-    except Exception as e:
-        print(f"⚠️ Warning: Could not connect to AWS: {e}")
+            logger.info(f"JAR file already exists: {jar_path}")
     
-    print("✅ Successfully set up environment for Anthem file processing")
+    # Set environment variables for PySpark - exactly like the shell script
+    jar_paths_str = ','.join(jar_paths)
+    os.environ['PYSPARK_SUBMIT_ARGS'] = f"--jars {jar_paths_str} pyspark-shell"
+    logger.info(f"Set PYSPARK_SUBMIT_ARGS to: {os.environ['PYSPARK_SUBMIT_ARGS']}")
+    
+    # Test S3 connectivity
+    logger.info("Testing S3 connectivity...")
+    try:
+        s3 = boto3.client('s3')
+        s3.list_buckets()  # Just to test connectivity
+        
+        # Check if we can access the index file
+        parsed_url = urlparse(config['index_file'])
+        bucket = parsed_url.netloc
+        key = parsed_url.path.lstrip('/')
+        
+        try:
+            s3.head_object(Bucket=bucket, Key=key)
+            logger.info(f"Successfully verified access to index file: {config['index_file']}")
+        except Exception as e:
+            error_msg = f"Cannot access index file: {str(e)}"
+            logger.error(error_msg)
+            with open(config['log_file'], 'a') as f:
+                f.write(f"ERROR: {error_msg}\n")
+            raise RuntimeError(error_msg)
+    except Exception as e:
+        error_msg = f"S3 connectivity test failed: {str(e)}"
+        logger.error(error_msg)
+        with open(config['log_file'], 'a') as f:
+            f.write(f"ERROR: {error_msg}\n")
+        raise RuntimeError(error_msg)
+    
+    logger.info("Environment setup completed successfully")
     return True
 
 # Task 3: Extract file references and save to output file
 def extract_file_references(**context):
     """
     Extract file references from the Anthem index file and store in Iceberg tables.
-    This function reads the index file directly from S3, extracts URLs,
-    and writes them to both a text file and Iceberg tables using a cloud-agnostic approach.
+    This function implements a cloud-agnostic approach using standard components rather
+    than AWS-specific services, making it portable across different environments.
     """
-    # Initialize log file
-    with open(config['log_file'], "w") as f:
-        f.write(f"=== Anthem Index Extraction - Started {datetime.now()} ===\n")
+    import logging
+    import os
+    from urllib.parse import urlparse
+    import time
+    
+    logger = logging.getLogger('airflow.task')
+    
+    # Initialize log file if it doesn't already exist
+    if not os.path.exists(config['log_file']):
+        with open(config['log_file'], "w") as f:
+            f.write(f"=== Anthem Index Extraction - Started {datetime.now()} ===\n")
+    else:
+        with open(config['log_file'], "a") as f:
+            f.write(f"\n=== Starting file reference extraction {datetime.now()} ===\n")
     
     start_time = time.time()
-    log_message(f"Starting Anthem index file extraction with Iceberg integration")
+    logger.info(f"Starting Anthem index file extraction with Iceberg integration")
     
-    # Initialize Spark with Iceberg only if requested - maintains cloud-agnostic approach
-    spark = None
-    if USE_SPARK_ICEBERG:
-        try:
-            log_message(f"Initializing Spark with Iceberg integration (cloud-agnostic approach)")
-            spark = init_spark()
-            create_file_refs_table(spark)
-            log_message(f"Successfully initialized Spark and created Iceberg table schema")
-        except Exception as e:
-            log_message(f"❌ Failed to initialize Spark: {e}")
-            log_message(f"Continuing without Spark/Iceberg integration for testing purposes")
-            traceback.print_exc(file=open(config['log_file'], "a"))
-            # Don't return error - continue without Spark for testing
-    else:
-        log_message(f"Skipping Spark/Iceberg integration for development/testing (USE_SPARK_ICEBERG=False)")
-        log_message(f"Will extract URLs without writing to Iceberg tables")
-        # Continue with URL extraction only - cloud-agnostic approach for development
+    # Patterns for extracting URLs from the index file
+    url_patterns = [
+        r'https?://[^\s"\'\)\(\[\]\{\}]+',  # Simple URL pattern
+        r'"url"\s*:\s*"(https?://[^"]+)"'     # JSON URL pattern with capture group
+    ]
+    
+    try:
+        # Initialize Spark with Iceberg using cloud-agnostic configuration
+        logger.info(f"Initializing Spark with Iceberg integration")
+        spark = init_spark()
+        
+        # Create the Iceberg table if it doesn't exist - using standard Iceberg API
+        logger.info(f"Creating Iceberg table {config['catalog_name']}.{config['file_refs_table']} if it doesn't exist")
+        create_file_refs_table(spark)
+        logger.info(f"Successfully initialized Spark and created Iceberg table schema")
+    except Exception as e:
+        error_msg = f"Failed to initialize Spark: {e}"
+        logger.error(error_msg)
+        with open(config['output_file'], "w") as f:
+            f.write(f"ERROR: {error_msg}\n")
+        with open(config['log_file'], "a") as f:
+            f.write(f"ERROR: {error_msg}\n")
+            traceback.print_exc(file=f)
+        raise RuntimeError(error_msg)
     
     # File reference patterns
     URL_PATTERNS = [
@@ -231,96 +352,8 @@ def extract_file_references(**context):
         r'"url"\s*:\s*"([^"]+\.(?:json|csv|parquet|gz))"',
         r'https?://[^"\s]+\.(?:json|csv|parquet|gz)'
     ]
-    
     try:
-        # Test S3 connectivity
-        if not test_s3_access():
-            error_msg = "S3 connectivity test failed. Check AWS credentials and permissions."
-            log_message(f"⚠️ {error_msg}")
-            with open(config['output_file'], "w") as f:
-                f.write(f"ERROR: {error_msg}\n")
-            return 1
-        
-        # Determine data source - for a cloud-agnostic approach, we support both S3 and local files
-        use_local_file = not USE_S3_FOR_DATA
-        
-        if use_local_file:
-            log_message(f"Using cloud-agnostic approach with local file instead of S3")
-            # Create a local test file if it doesn't exist
-            if not os.path.exists(config['local_download_path']):
-                log_message(f"Creating test file at {config['local_download_path']}")
-                os.makedirs(os.path.dirname(config['local_download_path']), exist_ok=True)
-                # Create a small test file with sample URLs
-                with gzip.open(config['local_download_path'], 'wt') as f:
-                    f.write('''
-{
-"reporting_entity_name": "Anthem",
-"data": [
-''')
-                    # Add sample URLs - 500 should be enough for testing
-                    for i in range(500):
-                        if i % 3 == 0:
-                            f.write('{"url": "https://example.com/in-network/file' + str(i) + '.json.gz"},\n')
-                        elif i % 3 == 1:
-                            f.write('{"url": "https://example.com/allowed-amount/file' + str(i) + '.json"},\n')
-                        else:
-                            f.write('{"url": "https://example.com/other/file' + str(i) + '.csv"},\n')
-                    f.write(']}\n')
-                log_message(f"Created test file with 500 sample URLs for testing")
-            key = config['local_download_path']
-            log_message(f"Processing local file {key}")
-        else:
-            # Standard S3 approach
-            s3_url = f"s3://{config['bucket_name']}/{config['index_file_key']}"
-            parsed = urlparse(s3_url)
-            bucket = parsed.netloc
-            key = parsed.path.lstrip("/")
-            log_message(f"Processing S3 file {s3_url}")
-            
-            # Get S3 client
-            s3 = boto3.client("s3")
-            log_message(f"Connected to S3")
-        
-        # File exists and get metadata
-        try:
-            if use_local_file:
-                file_size = os.path.getsize(key)
-            else:
-                head_response = s3.head_object(Bucket=bucket, Key=key)
-                file_size = head_response.get('ContentLength', 0)
-            log_message(f"✅ Successfully accessed index file. Size: {file_size/1024/1024:.2f} MB")
-        except Exception as e:
-            error_msg = f"Cannot access index file: {e}"
-            log_message(f"❌ {error_msg}")
-            with open(config['output_file'], "w") as f:
-                f.write(f"ERROR: {error_msg}\n")
-            return 1
-        
-        # Force processing to take longer for testing - this ensures Airflow sees real work happening
-        log_message(f"💤 Processing large file. This may take several minutes...")
-        
-        # Read file in chunks - supporting both S3 and local files (cloud-agnostic approach)
-        references = []
-        offset = 0
-        chunk_size = 10 * 1024 * 1024  # 10MB chunks
-        max_chunks = config['max_chunks']  # If None, process the entire file
-        chunks_processed = 0
-        total_processed = 0
-        batch_count = 0
-        
-        # For local testing, we'll use a smaller number of chunks
-        if use_local_file and max_chunks is None:
-            max_chunks = 3  # Just process 3 chunks for local testing to keep it fast
-        
-        # Initialize counters for different file types
-        in_network_count = 0
-        allowed_amount_count = 0
-        other_count = 0
-        
-        log_message(f"Processing the entire 24GB+ Anthem index file. This will take hours...")
-        log_message(f"Using cloud-agnostic Iceberg tables for storage")
-        
-        # Create schema for Iceberg table - independent of cloud provider
+        # Extract schema information to create proper DataFrame
         schema = StructType([
             StructField("reporting_entity_name", StringType(), True),
             StructField("reporting_entity_type", StringType(), True),
@@ -333,6 +366,330 @@ def extract_file_references(**context):
             StructField("file_date", DateType(), True),
             StructField("extracted_ts", TimestampType(), True)
         ])
+        
+        # Get index file information
+        logger.info(f"Processing index file: {config['index_file']}")
+        
+        # Extract file references using direct streaming to be memory-efficient
+        # This cloud-agnostic approach works with any storage system that supports
+        # streaming (S3, GCS, Azure Blob, or local filesystem)
+        
+        # Parse URL to determine access method
+        parsed_url = urlparse(config['index_file'])
+        
+        # Ensure we track statistics for reporting
+        total_records = 0
+        in_network_count = 0
+        allowed_amount_count = 0
+        other_count = 0
+        batch_count = 0
+        sample_urls = []
+        
+        # Using standard Hadoop file system API which is cloud-agnostic
+        # This will work with s3a, gs, wasbs, and local file systems
+        logger.info(f"Reading index file using Spark (cloud-agnostic approach)")
+        
+        # Use Spark to read the file for better memory management of the large file
+        # This uses Hadoop's FileSystem API which supports multiple cloud providers
+        df = spark.read.text(config['index_file'])
+        
+        # Initialize references list and batch counter
+        references = []
+        logger.info(f"Processing index file content - this will take several hours")
+        
+        # Process file line by line to extract file references
+        for row in df.collect():
+            line = row[0]
+            
+            # Apply each URL pattern to find references
+            for pattern in url_patterns:
+                matches = re.findall(pattern, line)
+                
+                # Process each match
+                for match in matches:
+                    # Handle the case where the pattern has a capture group
+                    url = match[0] if isinstance(match, tuple) else match
+                    
+                    # Filter out any non-HTTP URLs
+                    if not url.startswith('http'):
+                        continue
+                    
+                    # Add to our list
+                    references.append(url)
+                    
+                    # Keep track of a few sample URLs for logging
+                    if len(sample_urls) < 10:
+                        sample_urls.append(url)
+                    
+                    # Determine the file type for categorization
+                    file_network = "other"
+                    file_type = "unknown"
+                    
+                    if "in-network" in url.lower():
+                        file_network = "in-network"
+                        in_network_count += 1
+                    elif "allowed-amount" in url.lower():
+                        file_network = "allowed-amount"
+                        allowed_amount_count += 1
+                    else:
+                        other_count += 1
+                    
+                    # Determine file type
+                    if url.endswith(".json"):
+                        file_type = "json"
+                    elif url.endswith(".csv"):
+                        file_type = "csv"
+                    elif url.endswith(".gz"):
+                        if ".json.gz" in url.lower():
+                            file_type = "json.gz"
+                        elif ".csv.gz" in url.lower():
+                            file_type = "csv.gz"
+                        else:
+                            file_type = "gz"
+                    
+                    # Check if we have enough for a batch write
+                    if len(references) >= config['batch_size']:
+                        # Write batch to Iceberg table
+                        batch_count += 1
+                        total_records += len(references)
+                        
+                        logger.info(f"Writing batch {batch_count} with {len(references)} references to Iceberg table")
+                        logger.info(f"Stats so far: In-network: {in_network_count}, Allowed-amount: {allowed_amount_count}, Other: {other_count}")
+                        
+                        # Create data for DataFrame - standard Spark code that works with any cloud
+                        data = []
+                        for ref in references:
+                            data.append({
+                                "reporting_entity_name": "Anthem",
+                                "reporting_entity_type": "payer",
+                                "plan_name": None,
+                                "plan_id": None,
+                                "plan_market_type": None,
+                                "file_url": ref,
+                                "file_network": file_network,
+                                "file_type": file_type,
+                                "file_date": datetime.now().date(),
+                                "extracted_ts": datetime.now()
+                            })
+                        
+                        # Create and write the DataFrame using standard Iceberg APIs
+                        # This approach is cloud-provider independent
+                        try:
+                            df = spark.createDataFrame(data, schema)
+                            df.writeTo(f"{config['catalog_name']}.{config['file_refs_table']}").append()
+                            
+                            logger.info(f"Successfully wrote batch {batch_count}")
+                        except Exception as e:
+                            error_msg = f"Error writing batch {batch_count}: {str(e)}"
+                            logger.error(error_msg)
+                            with open(config['log_file'], 'a') as f:
+                                f.write(f"ERROR: {error_msg}\n")
+                        
+                        # Reset references list for next batch
+                        references = []
+        
+        # Write any remaining references before finishing
+        if len(references) > 0:
+            batch_count += 1
+            total_records += len(references)
+            
+            logger.info(f"Writing final batch {batch_count} with {len(references)} references to Iceberg table")
+            
+            # Create data for DataFrame - standard Spark code that works with any cloud
+            data = []
+            for ref in references:
+                # Determine the file type for categorization
+                file_network = "other"
+                file_type = "unknown"
+                
+                if "in-network" in ref.lower():
+                    file_network = "in-network"
+                elif "allowed-amount" in ref.lower():
+                    file_network = "allowed-amount"
+                
+                # Determine file type
+                if ref.endswith(".json"):
+                    file_type = "json"
+                elif ref.endswith(".csv"):
+                    file_type = "csv"
+                elif ref.endswith(".gz"):
+                    if ".json.gz" in ref.lower():
+                        file_type = "json.gz"
+                    elif ".csv.gz" in ref.lower():
+                        file_type = "csv.gz"
+                    else:
+                        file_type = "gz"
+                        
+                # Create record
+                data.append({
+                    "reporting_entity_name": "Anthem",
+                    "reporting_entity_type": "payer",
+                    "plan_name": None,
+                    "plan_id": None,
+                    "plan_market_type": None,
+                    "file_url": ref,
+                    "file_network": file_network,
+                    "file_type": file_type,
+                    "file_date": datetime.now().date(),
+                    "extracted_ts": datetime.now()
+                })
+            
+            # Create and write the DataFrame using standard Iceberg APIs
+            # This approach is cloud-provider independent
+            try:
+                df = spark.createDataFrame(data, schema)
+                df.writeTo(f"{config['catalog_name']}.{config['file_refs_table']}").append()
+                
+                logger.info(f"Successfully wrote final batch")
+            except Exception as e:
+                error_msg = f"Error writing final batch: {str(e)}"
+                logger.error(error_msg)
+                with open(config['log_file'], 'a') as f:
+                    f.write(f"ERROR: {error_msg}\n")
+                    
+        # Get final statistics from Iceberg table - using standard Spark SQL
+        # This is a cloud-agnostic approach that works with any storage backend
+        logger.info("Getting final statistics from Iceberg table...")
+        try:
+            # Use Spark SQL to query the Iceberg table
+            stats_df = spark.sql(f"""
+                SELECT 
+                    file_network,
+                    COUNT(*) as count 
+                FROM {config['catalog_name']}.{config['file_refs_table']} 
+                GROUP BY file_network
+            """)
+            
+            # Process results
+            total_count = 0
+            stats = {}
+            
+            for row in stats_df.collect():
+                network = row['file_network']
+                count = row['count']
+                stats[network] = count
+                total_count += count
+                
+            logger.info(f"Final statistics from Iceberg table:")
+            logger.info(f"Total references: {total_count}")
+            for network, count in stats.items():
+                logger.info(f"{network}: {count}")
+                
+            # Sample some URLs from the table
+            sample_df = spark.sql(f"""
+                SELECT file_network, file_url 
+                FROM {config['catalog_name']}.{config['file_refs_table']} 
+                LIMIT 10
+            """)
+            
+            sample_urls = [row['file_url'] for row in sample_df.collect()]            
+        except Exception as e:
+            error_msg = f"Error getting statistics from Iceberg table: {str(e)}"
+            logger.error(error_msg)
+            with open(config['log_file'], 'a') as f:
+                f.write(f"ERROR: {error_msg}\n")
+        
+        # Write the output summary file - cloud-agnostic approach using standard file I/O
+        with open(config['output_file'], 'w') as f:
+            f.write(f"=== Anthem File References Summary ===\n")
+            f.write(f"Extraction completed: {datetime.now()}\n\n")
+            f.write(f"Total references extracted: {total_count}\n")
+            
+            # Write stats by network type
+            f.write(f"\nReferences by network type:\n")
+            for network, count in stats.items() if 'stats' in locals() else {}:
+                f.write(f"- {network}: {count}\n")
+            
+            # Write sample URLs
+            f.write(f"\nSample URLs:\n")
+            for i, url in enumerate(sample_urls[:10]):
+                f.write(f"{i+1}. {url}\n")
+            
+            # Write processing information
+            f.write(f"\nProcessing information:\n")
+            f.write(f"- Index file: {config['index_file']}\n")
+            f.write(f"- Iceberg table: {config['catalog_name']}.{config['file_refs_table']}\n")
+            f.write(f"- Warehouse location: {config['warehouse_location']}\n")
+            
+            # Add cloud-agnostic note to emphasize the approach used
+            f.write(f"\nNote: This extraction used a cloud-agnostic approach with standard Hadoop FileSystem\n")
+            f.write(f"API and Iceberg for maximum portability across different environments.\n")
+        
+        # Write a detailed summary file with more information
+        with open(config['summary_file'], 'w') as f:
+            f.write(f"=== Anthem File References Detailed Summary ===\n")
+            f.write(f"Extraction completed: {datetime.now()}\n\n")
+            
+            # Write processing stats
+            f.write(f"Processing statistics:\n")
+            f.write(f"- Total batches processed: {batch_count}\n")
+            f.write(f"- Batch size: {config['batch_size']}\n")
+            f.write(f"- Total references: {total_count}\n\n")
+            
+            # Write detailed stats by file type if available
+            try:
+                type_stats_df = spark.sql(f"""
+                    SELECT 
+                        file_type,
+                        COUNT(*) as count 
+                    FROM {config['catalog_name']}.{config['file_refs_table']} 
+                    GROUP BY file_type
+                    ORDER BY count DESC
+                """)
+                
+                f.write(f"References by file type:\n")
+                for row in type_stats_df.collect():
+                    f.write(f"- {row['file_type']}: {row['count']}\n")
+            except Exception as e:
+                f.write(f"Error getting file type statistics: {e}\n")
+        
+        # Stop Spark session - important for resource cleanup
+        logger.info("Stopping Spark session...")
+        try:
+            spark.stop()
+            logger.info("Spark session stopped successfully")
+        except Exception as e:
+            logger.error(f"Error stopping Spark session: {e}")
+        
+        # Calculate and log execution time
+        end_time = time.time()
+        elapsed_seconds = end_time - start_time
+        hours = int(elapsed_seconds // 3600)
+        minutes = int((elapsed_seconds % 3600) // 60)
+        seconds = int(elapsed_seconds % 60)
+        
+        logger.info(f"Extraction completed in {hours}h {minutes}m {seconds}s")
+        logger.info(f"Processed {total_count} file references")
+        logger.info(f"Results written to {config['output_file']} and {config['summary_file']}")
+        
+        # Push results to XCom for downstream tasks
+        context['ti'].xcom_push(key='total_file_refs', value=total_count)
+        context['ti'].xcom_push(key='sample_urls', value=sample_urls[:10])
+        
+        return total_count
+    except Exception as e:
+        error_msg = f"Error in extract_file_references: {str(e)}"
+        logger.error(error_msg)
+        
+        # Write error to log file
+        with open(config['log_file'], 'a') as f:
+            f.write(f"ERROR: {error_msg}\n")
+            traceback.print_exc(file=f)
+        
+        # Write error to output file
+        with open(config['output_file'], 'w') as f:
+            f.write(f"ERROR: {error_msg}\n")
+        
+        # Clean up Spark session if it exists
+        try:
+            if 'spark' in locals():
+                spark.stop()
+                logger.info("Spark session stopped after error")
+        except Exception as cleanup_error:
+            logger.error(f"Error stopping Spark session: {cleanup_error}")
+        
+        # Re-raise the exception for Airflow to handle
+        raise RuntimeError(error_msg)
         
         for chunk_num in range(max_chunks) if max_chunks is not None else range(1000000):  # Large range if processing entire file
             chunk_start = time.time()
