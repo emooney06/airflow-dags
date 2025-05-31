@@ -665,7 +665,7 @@ def test_s3_access():
     dag_id='process_anthem_index_file_references',
     default_args=default_args,
     description='Process Anthem price transparency data to Iceberg tables (TaskFlow API)',
-    schedule_interval='@monthly',
+    schedule='@monthly',
     start_date=datetime(2025, 5, 1),
     catchup=False,
     tags=['price-transparency', 'anthem', 'iceberg', 'taskflow'],
