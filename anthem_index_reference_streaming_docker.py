@@ -4,14 +4,18 @@ from airflow import DAG
 from airflow.providers.docker.operators.docker import DockerOperator
 from airflow.models import Variable
 
-# Default arguments
+# Default arguments for long-running tasks
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
-    'email_on_failure': False,
+    'email_on_failure': True,  # Enable email notifications for failures
     'email_on_retry': False,
-    'retries': 1,
-    'retry_delay': timedelta(minutes=5),
+    'retries': 2,  # Increase retries for resilience
+    'retry_delay': timedelta(minutes=15),  # Longer retry delay
+    'execution_timeout': None,  # No timeout for task execution
+    'pool': 'long_tasks',  # Use a dedicated worker pool if configured
+    'priority_weight': 10,  # Higher priority
+    'max_active_tis_per_dag': 1,  # Only run one task instance at a time
 }
 
 # Get parameters from Airflow Variables with defaults
@@ -27,11 +31,13 @@ PROGRESS_INTERVAL = int(Variable.get("anthem_progress_interval", "30"))
 dag = DAG(
     'anthem_index_reference_streaming_docker',
     default_args=default_args,
-    description='Process Anthem index file references using containerized Spark/Iceberg',
-    schedule='@monthly',
+    description='Process Anthem index file references using Docker container',
+    schedule_interval='0 0 1 * *',  # Run monthly on the 1st
     start_date=datetime(2025, 5, 1),
     catchup=False,
-    tags=['anthem', 'spark', 'iceberg', 'container', 'docker'],
+    tags=['iceberg', 'docker', 'container', 'anthem', 'price-transparency'],
+    # Settings for long-running tasks
+    dagrun_timeout=None,  # No timeout for the entire DAG run
 )
 
 # Define the task
@@ -59,7 +65,10 @@ process_anthem_index_reference = DockerOperator(
         'AWS_SECRET_ACCESS_KEY': '{{ conn.AWS_S3.password }}',
         'AWS_REGION': 'us-west-2'
     },
-    # Increase timeout to prevent ReadTimeout errors
-    timeout=300,  # 5 minutes timeout instead of default 60 seconds
+    # Configuration for long-running processes
+    timeout=3600,  # 1 hour API timeout
+    tty=True,      # Allocate a pseudo-TTY to improve log streaming
+    mount_tmp_dir=False,  # Don't mount a temp directory to reduce overhead
+    retrieve_output=False,  # Don't try to capture output (reduces memory usage)
     dag=dag,
 )
