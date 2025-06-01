@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.providers.docker.operators.docker import DockerOperator
 from airflow.models import Variable
+from airflow.providers.amazon.aws.hooks.base_aws import AwsBaseHook
 
 # Default arguments
 default_args = {
@@ -34,10 +35,24 @@ dag = DAG(
     tags=['anthem', 'spark', 'iceberg', 'container', 'docker'],
 )
 
+
+def get_task_instance_context(**context):
+    aws_hook = AwsBaseHook(aws_conn_id='aws_default')
+    credentials = aws_hook.get_credentials()
+    
+    return DockerOperator(
+        # ... other parameters ...
+        environment={
+            'AWS_ACCESS_KEY_ID': credentials.access_key,
+            'AWS_SECRET_ACCESS_KEY': credentials.secret_key,
+            'AWS_REGION': 'us-west-2',
+        },
+        # ... other parameters ...
+    )
 # Get AWS credentials from Airflow Variables
-aws_access_key = Variable.get("aws_access_key_id", "")
-aws_secret_key = Variable.get("aws_secret_access_key", "")
-aws_region = Variable.get("aws_region", "us-west-2")
+# aws_access_key = Variable.get("aws_access_key_id", "")
+# aws_secret_key = Variable.get("aws_secret_access_key", "")
+# aws_region = Variable.get("aws_region", "us-west-2")
 
 # Define the task
 process_anthem_index_reference = DockerOperator(
