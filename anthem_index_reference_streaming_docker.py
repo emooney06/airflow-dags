@@ -37,17 +37,16 @@ dag = DAG(
 
 
 def get_task_instance_context(**context):
-    aws_hook = AwsBaseHook(aws_conn_id='aws_default')
+    aws_hook = AwsBaseHook(aws_conn_id='AWS_S3')
     credentials = aws_hook.get_credentials()
     
     return DockerOperator(
         # ... other parameters ...
         environment={
-            'AWS_ACCESS_KEY_ID': credentials.access_key,
-            'AWS_SECRET_ACCESS_KEY': credentials.secret_key,
+            'AWS_ACCESS_KEY_ID': credentials.login,
+            'AWS_SECRET_ACCESS_KEY': credentials.password,
             'AWS_REGION': 'us-west-2',
         },
-        # ... other parameters ...
     )
 # Get AWS credentials from Airflow Variables
 # aws_access_key = Variable.get("aws_access_key_id", "")
