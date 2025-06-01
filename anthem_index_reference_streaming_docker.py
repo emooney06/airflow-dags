@@ -44,7 +44,7 @@ process_anthem_index_reference = DockerOperator(
     task_id='process_anthem_index_reference',
     image='anthem-streaming:latest',
     api_version='auto',
-    auto_remove=True,
+    auto_remove='success',  # In Airflow 3, this must be 'never', 'success', or 'force',
     docker_url="unix://var/run/docker.sock",  # For Docker
     command=[
         "--index-file", INDEX_FILE,
