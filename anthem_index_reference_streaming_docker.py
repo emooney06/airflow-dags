@@ -59,5 +59,9 @@ process_anthem_index_reference = DockerOperator(
         'AWS_SECRET_ACCESS_KEY': '{{ conn.AWS_S3.password }}',
         'AWS_REGION': 'us-west-2'
     },
+    # Increase timeout to prevent ReadTimeout errors
+    api_version='auto',
+    docker_url='unix://var/run/docker.sock',
+    timeout=300,  # 5 minutes timeout instead of default 60 seconds
     dag=dag,
 )
