@@ -32,7 +32,7 @@ dag = DAG(
     'anthem_index_reference_streaming_docker',
     default_args=default_args,
     description='Process Anthem index file references using Docker container',
-    schedule_interval='0 0 1 * *',  # Run monthly on the 1st
+    schedule='@monthly',  # Run monthly on the 1st
     start_date=datetime(2025, 5, 1),
     catchup=False,
     tags=['iceberg', 'docker', 'container', 'anthem', 'price-transparency'],
