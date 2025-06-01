@@ -45,7 +45,7 @@ process_anthem_index_reference = DockerOperator(
     task_id='process_anthem_index_reference',
     image='anthem-streaming:latest',
     api_version='auto',
-    auto_remove=True,  # Changed from 'success' to True for compatibility
+    auto_remove='success',  # Valid values are 'never', 'success', or 'force'
     docker_url='unix://var/run/docker.sock',
     network_mode='bridge',
     # The AWS credentials will be retrieved from the connection during execution
