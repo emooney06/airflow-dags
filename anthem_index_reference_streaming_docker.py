@@ -60,8 +60,6 @@ process_anthem_index_reference = DockerOperator(
         'AWS_REGION': 'us-west-2'
     },
     # Increase timeout to prevent ReadTimeout errors
-    api_version='auto',
-    docker_url='unix://var/run/docker.sock',
     timeout=300,  # 5 minutes timeout instead of default 60 seconds
     dag=dag,
 )
