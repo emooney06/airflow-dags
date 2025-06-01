@@ -48,6 +48,7 @@ def get_task_instance_context(**context):
             'AWS_REGION': 'us-west-2',
         },
     )
+
 # Get AWS credentials from Airflow Variables
 # aws_access_key = Variable.get("aws_access_key_id", "")
 # aws_secret_key = Variable.get("aws_secret_access_key", "")
@@ -69,10 +70,5 @@ process_anthem_index_reference = DockerOperator(
         "--max-records", str(MAX_RECORDS),
         "--progress-interval", str(PROGRESS_INTERVAL)
     ],
-    environment={
-        'AWS_ACCESS_KEY_ID': aws_access_key,
-        'AWS_SECRET_ACCESS_KEY': aws_secret_key,
-        'AWS_REGION': aws_region
-    },
     dag=dag,
 )
