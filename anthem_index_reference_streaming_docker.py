@@ -34,10 +34,10 @@ dag = DAG(
     tags=['anthem', 'spark', 'iceberg', 'container', 'docker'],
 )
 
-# Get AWS credentials from environment variables or Airflow connections
-aws_access_key = "{{ conn.aws_default.login }}"
-aws_secret_key = "{{ conn.aws_default.password }}"
-aws_region = "{{ conn.aws_default.extra_dejson.region }}"
+# Get AWS credentials from Airflow Variables
+aws_access_key = Variable.get("aws_access_key_id", "")
+aws_secret_key = Variable.get("aws_secret_access_key", "")
+aws_region = Variable.get("aws_region", "us-west-2")
 
 # Define the task
 process_anthem_index_reference = DockerOperator(
